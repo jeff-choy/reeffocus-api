@@ -144,7 +144,38 @@ app.post(
   })
 );
 
-/** Everyone else on this server — the beta's "friends" list. */
+/**
+ * Add a friend by diver name. Names are unique, so the name is the handle.
+ * Symmetric: both of you see each other immediately, with no accept step —
+ * a pending-request flow is more than a private beta needs.
+ */
+app.post(
+  '/api/friends',
+  requireUser,
+  asyncRoute(async (req, res) => {
+    const name = String(req.body?.name ?? '').trim();
+    if (!name) return res.status(400).json({ error: 'Enter a diver name.' });
+
+    const found = await query<{ id: string; name: string }>(
+      'SELECT id, name FROM users WHERE LOWER(name) = LOWER($1)',
+      [name]
+    );
+    const other = found.rows[0];
+    if (!other) return res.status(404).json({ error: `No diver called “${name}”.` });
+    if (other.id === req.user!.id) return res.status(400).json({ error: 'That’s you.' });
+
+    await tx(async (c) => {
+      await c.query(
+        `INSERT INTO friendships (user_id, friend_id) VALUES ($1,$2), ($2,$1)
+         ON CONFLICT DO NOTHING`,
+        [req.user!.id, other.id]
+      );
+    });
+    res.status(201).json({ id: other.id, name: other.name });
+  })
+);
+
+/** Your friends on this server. */
 app.get(
   '/api/divers',
   requireUser,
@@ -160,6 +191,7 @@ app.get(
          LEFT JOIN user_stats s ON s.user_id = u.id
          LEFT JOIN user_species sp ON sp.user_id = u.id
         WHERE u.id <> $1
+          AND EXISTS (SELECT 1 FROM friendships f WHERE f.user_id = $1 AND f.friend_id = u.id)
         GROUP BY u.id, s.total_mins, s.dives
         ORDER BY u.last_seen DESC`,
       [req.user!.id]
@@ -270,7 +302,26 @@ app.post(
   '/api/rooms/:id/leave',
   requireUser,
   asyncRoute(async (req, res) => {
-    await query('DELETE FROM room_members WHERE room_id = $1 AND user_id = $2', [req.params.id, req.user!.id]);
+    // A room with nobody in it is litter — the last diver out deletes it.
+    // Done in one transaction so two people leaving at once can't both read a
+    // non-empty room and leave it stranded.
+    const removed = await tx(async (c) => {
+      // Lock the room row, not the member count: Postgres rejects FOR UPDATE
+      // alongside an aggregate. Locking the room still serialises two people
+      // leaving at once, which is the race we care about.
+      await c.query('SELECT 1 FROM rooms WHERE id = $1 FOR UPDATE', [req.params.id]);
+      await c.query('DELETE FROM room_members WHERE room_id = $1 AND user_id = $2', [req.params.id, req.user!.id]);
+      const left = await c.query<{ n: string }>(
+        'SELECT count(*)::int AS n FROM room_members WHERE room_id = $1',
+        [req.params.id]
+      );
+      if (Number(left.rows[0]?.n ?? 0) === 0) {
+        await c.query('DELETE FROM rooms WHERE id = $1', [req.params.id]);
+        return true;
+      }
+      return false;
+    });
+    if (removed) return res.json({ id: req.params.id, removed: true });
     res.json((await roomsWithMembers()).find((x: any) => x.id === req.params.id) ?? { id: req.params.id, removed: true });
   })
 );

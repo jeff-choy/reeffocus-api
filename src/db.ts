@@ -105,6 +105,17 @@ export async function initSchema() {
     -- Diver names are how you tell each other apart when trading, so they must
     -- be unique — case-insensitively, so "Jeff" and "jeff" can't both exist.
     CREATE UNIQUE INDEX IF NOT EXISTS users_name_unique ON users (LOWER(name));
+
+    -- Friendship is symmetric: adding someone stores both directions, so the
+    -- lookup is a plain WHERE user_id = $1 with no OR across two columns.
+    -- The CHECK stops a diver befriending themselves.
+    CREATE TABLE IF NOT EXISTS friendships (
+      user_id   TEXT NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+      friend_id TEXT NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+      since     TIMESTAMPTZ NOT NULL DEFAULT now(),
+      PRIMARY KEY (user_id, friend_id),
+      CHECK (user_id <> friend_id)
+    );
   `);
 }
 
