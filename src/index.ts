@@ -42,25 +42,66 @@ const AVATARS = ['#9fd9d3', '#FFB5A7', '#FFD700', '#bfdde6', '#4FC3D9', '#4ADE80
 
 app.get('/api/health', (_req, res) => res.json({ ok: true, service: 'reeffocus-api', time: Date.now() }));
 
+// ── names ───────────────────────────────────────────────────────────────────
+const NAME_RE = /^[\p{L}\p{N} ._-]{2,20}$/u;
+
+/** Returns an error string, or null if the name is well-formed. */
+function validateName(name: string): string | null {
+  if (name.length < 2) return 'Name must be at least 2 characters.';
+  if (name.length > 20) return 'Name must be 20 characters or fewer.';
+  if (!NAME_RE.test(name)) return 'Use letters, numbers, spaces, . _ or - only.';
+  return null;
+}
+
+/** Is this name free? `deviceId` lets you keep your own name. */
+async function nameTaken(name: string, deviceId?: string) {
+  const r = await query<{ id: string }>('SELECT id FROM users WHERE LOWER(name) = LOWER($1)', [name]);
+  const owner = r.rows[0];
+  return !!owner && owner.id !== deviceId;
+}
+
+app.get(
+  '/api/name-check',
+  asyncRoute(async (req, res) => {
+    const name = String(req.query.name ?? '').trim();
+    const deviceId = req.header('x-device-id') ?? undefined;
+    const problem = validateName(name);
+    if (problem) return res.json({ available: false, reason: problem });
+    if (await nameTaken(name, deviceId)) return res.json({ available: false, reason: 'That name is taken.' });
+    res.json({ available: true, reason: null });
+  })
+);
+
 /** First launch: claim a user row for this device. Idempotent. */
 app.post(
   '/api/register',
   asyncRoute(async (req, res) => {
     const deviceId = String(req.body?.deviceId ?? '').trim();
-    const rawName = String(req.body?.name ?? '').trim();
+    const name = String(req.body?.name ?? '').trim();
     if (!deviceId) return res.status(400).json({ error: 'deviceId required' });
-    const name = (rawName || 'Diver').slice(0, 24);
+
+    const problem = validateName(name);
+    if (problem) return res.status(400).json({ error: problem });
+    if (await nameTaken(name, deviceId)) return res.status(409).json({ error: 'That name is taken.' });
+
     const initial = name[0].toUpperCase();
     const avatar = AVATARS[Math.abs([...deviceId].reduce((a, c) => a + c.charCodeAt(0), 0)) % AVATARS.length];
 
-    await tx(async (c) => {
-      await c.query(
-        `INSERT INTO users (id, name, initial, avatar_bg) VALUES ($1, $2, $3, $4)
-         ON CONFLICT (id) DO UPDATE SET name = EXCLUDED.name, initial = EXCLUDED.initial, last_seen = now()`,
-        [deviceId, name, initial, avatar]
-      );
-      await c.query('INSERT INTO user_stats (user_id) VALUES ($1) ON CONFLICT DO NOTHING', [deviceId]);
-    });
+    try {
+      await tx(async (c) => {
+        await c.query(
+          `INSERT INTO users (id, name, initial, avatar_bg) VALUES ($1, $2, $3, $4)
+           ON CONFLICT (id) DO UPDATE SET name = EXCLUDED.name, initial = EXCLUDED.initial, last_seen = now()`,
+          [deviceId, name, initial, avatar]
+        );
+        await c.query('INSERT INTO user_stats (user_id) VALUES ($1) ON CONFLICT DO NOTHING', [deviceId]);
+      });
+    } catch (e: any) {
+      // Two devices can race past the pre-check; the unique index is the real
+      // arbiter, so translate its violation into the same friendly conflict.
+      if (e?.code === '23505') return res.status(409).json({ error: 'That name is taken.' });
+      throw e;
+    }
 
     const u = await query<User>('SELECT * FROM users WHERE id = $1', [deviceId]);
     res.json({ user: u.rows[0], collection: await collectionOf(deviceId) });

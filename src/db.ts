@@ -101,6 +101,10 @@ export async function initSchema() {
 
     CREATE INDEX IF NOT EXISTS trades_to_status ON trades(to_id, status);
     CREATE INDEX IF NOT EXISTS trades_from_status ON trades(from_id, status);
+
+    -- Diver names are how you tell each other apart when trading, so they must
+    -- be unique — case-insensitively, so "Jeff" and "jeff" can't both exist.
+    CREATE UNIQUE INDEX IF NOT EXISTS users_name_unique ON users (LOWER(name));
   `);
 }
 
