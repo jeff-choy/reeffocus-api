@@ -253,19 +253,56 @@ app.get(
 );
 
 // ── rooms ───────────────────────────────────────────────────────────────────
+/**
+ * Collective progression, derived from the room's finished dives rather than a
+ * counter anyone could inflate:
+ *   sharedDepth — every metre the room has ever dived, added up. The number that
+ *                 makes a room feel like it's going somewhere together.
+ *   corals      — one coral planted per full hour the room has focused.
+ */
+const CORAL_PER_MINS = 60;
+
 async function roomsWithMembers() {
   const r = await query(
-    `SELECT r.id, r.name, r.depth, h.name AS host,
-            COALESCE(JSON_AGG(JSON_BUILD_OBJECT('id', u.id, 'initial', u.initial, 'bg', u.avatar_bg))
-                     FILTER (WHERE u.id IS NOT NULL), '[]') AS participants
+    `SELECT r.id, r.name, r.kind, r.depth, r.schedule, r.start_min, r.start_at,
+            h.name AS host, r.host_id,
+            COALESCE(JSON_AGG(DISTINCT JSONB_BUILD_OBJECT('id', u.id, 'initial', u.initial, 'bg', u.avatar_bg))
+                     FILTER (WHERE u.id IS NOT NULL), '[]') AS participants,
+            COALESCE(d.total_mins, 0) AS total_mins,
+            COALESCE(d.total_depth, 0) AS total_depth,
+            COALESCE(d.dives, 0) AS dives
        FROM rooms r
        JOIN users h ON h.id = r.host_id
        LEFT JOIN room_members m ON m.room_id = r.id
        LEFT JOIN users u ON u.id = m.user_id
-      GROUP BY r.id, h.name
+       LEFT JOIN (
+         SELECT room_id,
+                SUM(mins)::int  AS total_mins,
+                SUM(depth)::int AS total_depth,
+                COUNT(*)::int   AS dives
+           FROM room_dives GROUP BY room_id
+       ) d ON d.room_id = r.id
+      GROUP BY r.id, h.name, d.total_mins, d.total_depth, d.dives
       ORDER BY r.created_at DESC`
   );
-  return r.rows.map((x: any) => ({ ...x, depth: Number(x.depth), minutesLeft: Number(x.depth) }));
+  return r.rows.map((x: any) => ({
+    id: x.id,
+    name: x.name,
+    kind: x.kind,
+    depth: x.depth === null ? null : Number(x.depth),
+    schedule: x.schedule,
+    startMin: x.start_min === null ? null : Number(x.start_min),
+    startAt: x.start_at,
+    host: x.host,
+    hostId: x.host_id,
+    participants: x.participants,
+    progress: {
+      dives: Number(x.dives),
+      totalMins: Number(x.total_mins),
+      sharedDepth: Number(x.total_depth),
+      corals: Math.floor(Number(x.total_mins) / CORAL_PER_MINS),
+    },
+  }));
 }
 
 app.get('/api/rooms', requireUser, asyncRoute(async (_req, res) => res.json(await roomsWithMembers())));
@@ -275,15 +312,76 @@ app.post(
   requireUser,
   asyncRoute(async (req, res) => {
     const name = String(req.body?.name ?? '').trim();
-    const depth = Number(req.body?.depth);
-    if (!name) return res.status(400).json({ error: 'name required' });
-    if (!Number.isFinite(depth) || depth < 1 || depth > 120) return res.status(400).json({ error: 'depth must be 1-120' });
+    const kind = String(req.body?.kind ?? 'room');
+    const schedule = String(req.body?.schedule ?? 'daily');
+
+    if (!name) return res.status(400).json({ error: 'Give the room a name.' });
+    if (kind !== 'room' && kind !== 'expedition') return res.status(400).json({ error: 'Unknown room kind.' });
+    if (schedule !== 'daily' && schedule !== 'once') return res.status(400).json({ error: 'Unknown schedule.' });
+
+    // Expeditions commit everyone to one length; rooms leave it to each diver.
+    let depth: number | null = null;
+    if (kind === 'expedition') {
+      const d = Number(req.body?.depth);
+      if (!Number.isFinite(d) || d < 10 || d > 120) {
+        return res.status(400).json({ error: 'An expedition needs a depth between 10 and 120 m.' });
+      }
+      depth = Math.round(d);
+    }
+
+    let startMin: number | null = null;
+    let startAt: string | null = null;
+    if (schedule === 'daily') {
+      const m = Number(req.body?.startMin);
+      if (!Number.isFinite(m) || m < 0 || m > 1439) {
+        return res.status(400).json({ error: 'Pick a start time.' });
+      }
+      startMin = Math.round(m);
+    } else {
+      const at = new Date(String(req.body?.startAt ?? ''));
+      if (Number.isNaN(at.getTime())) return res.status(400).json({ error: 'Pick a start date and time.' });
+      if (at.getTime() < Date.now() - 60_000) return res.status(400).json({ error: 'That start time is in the past.' });
+      startAt = at.toISOString();
+    }
+
     const id = 'r' + randomUUID().slice(0, 8);
     await tx(async (c) => {
-      await c.query('INSERT INTO rooms (id, name, depth, host_id) VALUES ($1,$2,$3,$4)', [id, name, Math.round(depth), req.user!.id]);
+      await c.query(
+        `INSERT INTO rooms (id, name, kind, depth, schedule, start_min, start_at, host_id)
+         VALUES ($1,$2,$3,$4,$5,$6,$7,$8)`,
+        [id, name, kind, depth, schedule, startMin, startAt, req.user!.id]
+      );
       await c.query('INSERT INTO room_members (room_id, user_id) VALUES ($1,$2)', [id, req.user!.id]);
     });
     res.status(201).json((await roomsWithMembers()).find((r: any) => r.id === id));
+  })
+);
+
+/**
+ * Report a finished dive against a room, feeding collective progression.
+ * Membership is checked server-side so you can't bank depth into a room you
+ * aren't in.
+ */
+app.post(
+  '/api/rooms/:id/dive',
+  requireUser,
+  asyncRoute(async (req, res) => {
+    const mins = Number(req.body?.mins);
+    const depth = Number(req.body?.depth);
+    if (!Number.isFinite(mins) || mins <= 0) return res.status(400).json({ error: 'mins required' });
+    if (!Number.isFinite(depth) || depth < 10 || depth > 120) return res.status(400).json({ error: 'depth must be 10-120' });
+
+    const member = await query('SELECT 1 FROM room_members WHERE room_id = $1 AND user_id = $2', [
+      req.params.id,
+      req.user!.id,
+    ]);
+    if (!member.rows[0]) return res.status(403).json({ error: 'You are not in that room.' });
+
+    await query(
+      'INSERT INTO room_dives (id, room_id, user_id, mins, depth) VALUES ($1,$2,$3,$4,$5)',
+      ['d' + randomUUID().slice(0, 8), req.params.id, req.user!.id, Math.round(mins), Math.round(depth)]
+    );
+    res.status(201).json((await roomsWithMembers()).find((r: any) => r.id === req.params.id));
   })
 );
 

@@ -71,13 +71,61 @@ export async function initSchema() {
       updated_at TIMESTAMPTZ NOT NULL DEFAULT now()
     );
 
+    -- Rooms changed shape (kind/schedule/nullable depth) and the old rows can't
+    -- be migrated honestly — an old room has no agreed time to infer. Drop the
+    -- old table once, on the first boot that sees the pre-'kind' schema. Guarded
+    -- on the column's absence, so it is a no-op on every boot after that and
+    -- never touches users, friendships or collections.
+    DO $$
+    BEGIN
+      IF EXISTS (SELECT 1 FROM information_schema.tables
+                  WHERE table_schema = 'public' AND table_name = 'rooms')
+         AND NOT EXISTS (SELECT 1 FROM information_schema.columns
+                          WHERE table_schema = 'public' AND table_name = 'rooms'
+                            AND column_name = 'kind')
+      THEN
+        DROP TABLE rooms CASCADE;
+      END IF;
+    END $$;
+
+    -- Two kinds of group dive:
+    --   'room'       — everyone starts at the agreed time, each picks their own
+    --                  length. Depth is NULL: it's per-diver.
+    --   'expedition' — everyone commits to the same length for a bigger reward,
+    --                  so depth is required.
+    -- Scheduling is either 'daily' (start_min, minutes past local midnight, every
+    -- day) or 'once' (start_at, an absolute instant). Storing the daily time as
+    -- minutes-past-midnight rather than a timestamp keeps it local to each diver's
+    -- clock — a 09:00 room is 09:00 wherever you are, which is what a habit means.
     CREATE TABLE IF NOT EXISTS rooms (
-      id         TEXT PRIMARY KEY,
-      name       TEXT NOT NULL,
-      depth      INTEGER NOT NULL CHECK (depth BETWEEN 1 AND 120),
-      host_id    TEXT NOT NULL REFERENCES users(id) ON DELETE CASCADE,
-      created_at TIMESTAMPTZ NOT NULL DEFAULT now()
+      id           TEXT PRIMARY KEY,
+      name         TEXT NOT NULL,
+      kind         TEXT NOT NULL DEFAULT 'room' CHECK (kind IN ('room','expedition')),
+      depth        INTEGER CHECK (depth BETWEEN 10 AND 120),
+      schedule     TEXT NOT NULL DEFAULT 'daily' CHECK (schedule IN ('daily','once')),
+      start_min    INTEGER CHECK (start_min BETWEEN 0 AND 1439),
+      start_at     TIMESTAMPTZ,
+      host_id      TEXT NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+      created_at   TIMESTAMPTZ NOT NULL DEFAULT now(),
+      -- An expedition without a depth is meaningless; a room with one is a lie.
+      CHECK ((kind = 'expedition') = (depth IS NOT NULL)),
+      -- Exactly one schedule field must be set, matching the schedule type.
+      CHECK ((schedule = 'daily') = (start_min IS NOT NULL)),
+      CHECK ((schedule = 'once')  = (start_at  IS NOT NULL))
     );
+
+    -- Every finished group dive, for collective progression. Kept per-dive rather
+    -- than as a running total so a room's depth/coral can be recomputed if the
+    -- rules change, and so one device can't inflate a counter it owns.
+    CREATE TABLE IF NOT EXISTS room_dives (
+      id        TEXT PRIMARY KEY,
+      room_id   TEXT NOT NULL REFERENCES rooms(id) ON DELETE CASCADE,
+      user_id   TEXT NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+      mins      INTEGER NOT NULL CHECK (mins > 0),
+      depth     INTEGER NOT NULL CHECK (depth BETWEEN 10 AND 120),
+      ts        TIMESTAMPTZ NOT NULL DEFAULT now()
+    );
+    CREATE INDEX IF NOT EXISTS room_dives_room ON room_dives(room_id);
 
     CREATE TABLE IF NOT EXISTS room_members (
       room_id   TEXT NOT NULL REFERENCES rooms(id) ON DELETE CASCADE,
