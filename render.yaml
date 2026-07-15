@@ -1,0 +1,14 @@
+# Render blueprint. In Render: New → Blueprint → point at this repo.
+# Free tier sleeps after ~15 min idle; the first request then takes ~30s to wake.
+services:
+  - type: web
+    name: reeffocus-api
+    runtime: node
+    plan: free
+    rootDir: server
+    buildCommand: npm ci && npm run build
+    startCommand: npm start
+    healthCheckPath: /api/health
+    envVars:
+      - key: NODE_VERSION
+        value: 22
