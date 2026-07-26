@@ -134,6 +134,37 @@ export async function initSchema() {
       PRIMARY KEY (room_id, user_id)
     );
 
+    -- Repair for a wound the 'kind' migration left behind: DROP TABLE rooms
+    -- CASCADE also dropped room_members' and room_dives' room_id foreign keys,
+    -- and CREATE TABLE IF NOT EXISTS never re-adds constraints to a table that
+    -- already exists — so on databases that lived through that migration,
+    -- deleting a room stranded its memberships and dives. Re-add the FKs under
+    -- the same names Postgres gives the inline ones, so the guard is a no-op
+    -- both on fresh databases and on every boot after the repair. NOT VALID
+    -- because a handful of orphaned rows from the old dropped rooms table
+    -- still exist and belong to real users — a boot-time migration shouldn't
+    -- delete user data. NOT VALID skips only the scan of existing rows; the
+    -- constraint (and its ON DELETE CASCADE) fully applies to everything new.
+    DO $$
+    BEGIN
+      IF NOT EXISTS (SELECT 1 FROM information_schema.table_constraints
+                      WHERE table_schema = 'public' AND table_name = 'room_members'
+                        AND constraint_name = 'room_members_room_id_fkey')
+      THEN
+        ALTER TABLE room_members
+          ADD CONSTRAINT room_members_room_id_fkey
+          FOREIGN KEY (room_id) REFERENCES rooms(id) ON DELETE CASCADE NOT VALID;
+      END IF;
+      IF NOT EXISTS (SELECT 1 FROM information_schema.table_constraints
+                      WHERE table_schema = 'public' AND table_name = 'room_dives'
+                        AND constraint_name = 'room_dives_room_id_fkey')
+      THEN
+        ALTER TABLE room_dives
+          ADD CONSTRAINT room_dives_room_id_fkey
+          FOREIGN KEY (room_id) REFERENCES rooms(id) ON DELETE CASCADE NOT VALID;
+      END IF;
+    END $$;
+
     -- A trade is an offer until the other side accepts. Nobody's fish moves
     -- without consent.
     CREATE TABLE IF NOT EXISTS trades (
@@ -150,6 +181,18 @@ export async function initSchema() {
     CREATE INDEX IF NOT EXISTS trades_to_status ON trades(to_id, status);
     CREATE INDEX IF NOT EXISTS trades_from_status ON trades(from_id, status);
 
+    -- Player reports, append-only — the app only ever inserts; moderation
+    -- reads the table directly. Both FKs cascade: a report about (or from) a
+    -- deleted account is meaningless without the account, and account deletion
+    -- must not be blocked by moderation paperwork.
+    CREATE TABLE IF NOT EXISTS reports (
+      id          TEXT PRIMARY KEY,
+      reporter_id TEXT NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+      target_id   TEXT NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+      reason      TEXT,
+      created_at  TIMESTAMPTZ NOT NULL DEFAULT now()
+    );
+
     -- Diver names are how you tell each other apart when trading, so they must
     -- be unique — case-insensitively, so "Jeff" and "jeff" can't both exist.
     CREATE UNIQUE INDEX IF NOT EXISTS users_name_unique ON users (LOWER(name));
@@ -164,6 +207,40 @@ export async function initSchema() {
       PRIMARY KEY (user_id, friend_id),
       CHECK (user_id <> friend_id)
     );
+
+    -- Blocking. App Review Guideline 1.2 requires that a user be able to stop
+    -- seeing, and being contacted by, another user. Deliberately one-directional
+    -- in storage but enforced both ways at read time: if either side has blocked
+    -- the other, neither appears to the other in divers, the leaderboard, rooms
+    -- or trades. Storing one row per (blocker, blocked) keeps "unblock" a plain
+    -- delete of the row the blocker created, without guessing who blocked whom.
+    CREATE TABLE IF NOT EXISTS blocks (
+      blocker_id TEXT NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+      blocked_id TEXT NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+      created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+      PRIMARY KEY (blocker_id, blocked_id),
+      CHECK (blocker_id <> blocked_id)
+    );
+    -- The read-time filter looks up "did anyone block either of us", so the
+    -- reverse direction needs its own index; the PK only covers blocker_id.
+    CREATE INDEX IF NOT EXISTS blocks_blocked ON blocks(blocked_id);
+
+    -- Added after launch, so they're ALTERs rather than part of the CREATEs:
+    --   users.avatar_url   — dormant. Held uploaded profile photos during the
+    --                        beta. Photos are not a v1 feature (unmoderated user
+    --                        images shown to strangers is a Guideline 1.2
+    --                        surface), so nothing writes or reads this now and
+    --                        every diver renders as an initials tile. Kept only
+    --                        so beta rows survive if photos return with
+    --                        moderation behind them.
+    --   user_stats.week_*  — this-week focus minutes, for a leaderboard that
+    --                        resets every Monday for everyone. week_start is the
+    --                        Monday the week_mins were accrued in; a stale
+    --                        week_start reads as zero this week (see the board
+    --                        query), so the reset needs no cron — it's implicit.
+    ALTER TABLE users ADD COLUMN IF NOT EXISTS avatar_url TEXT;
+    ALTER TABLE user_stats ADD COLUMN IF NOT EXISTS week_mins INTEGER NOT NULL DEFAULT 0;
+    ALTER TABLE user_stats ADD COLUMN IF NOT EXISTS week_start DATE;
   `);
 }
 

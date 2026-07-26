@@ -1,6 +1,9 @@
 import express, { NextFunction, Request, Response } from 'express';
 import cors from 'cors';
+import { rateLimit, ipKeyGenerator } from 'express-rate-limit';
 import { randomUUID } from 'node:crypto';
+import path from 'node:path';
+import { fileURLToPath } from 'node:url';
 import 'dotenv/config';
 import { query, tx, initSchema, collectionOf, addSpecies, pool } from './db.js';
 
@@ -10,10 +13,48 @@ app.use(express.json());
 
 const PORT = Number(process.env.PORT) || 4000;
 
+// ── rate limiting ───────────────────────────────────────────────────────────
+// The host's proxy terminates TLS in front of us; trust exactly one hop so the
+// limiter's IP fallback keys on the real client, not the proxy's own address.
+app.set('trust proxy', 1);
+
+// Keyed by device id — the app's identity — so one abusive install can't hide
+// behind a shared NAT IP (a dorm, an office) and get everyone else throttled.
+// IP is the fallback for traffic that predates registration.
+const limitKey = (req: Request) => req.header('x-device-id') ?? ipKeyGenerator(req.ip ?? '');
+const LIMIT_WINDOW_MS = 15 * 60 * 1000;
+// Same `{ error }` shape as every other API error, so clients need no special case.
+const LIMIT_MESSAGE = { error: 'Too many requests — slow down and try again in a bit.' };
+
+const globalLimiter = rateLimit({
+  windowMs: LIMIT_WINDOW_MS,
+  limit: 300,
+  standardHeaders: true,
+  legacyHeaders: false,
+  keyGenerator: limitKey,
+  message: LIMIT_MESSAGE,
+  // Health stays unthrottled: uptime monitors poll it on their own schedule
+  // and a 429 there would page us for a limiter, not an outage.
+  skip: (req) => req.path === '/api/health',
+});
+app.use(globalLimiter);
+
+// Registration, name probing and friend-adding are the abuse-shaped endpoints
+// (name enumeration, signup floods, spam adds), so they get a far tighter
+// budget than normal app traffic ever needs.
+const strictLimiter = rateLimit({
+  windowMs: LIMIT_WINDOW_MS,
+  limit: 30,
+  standardHeaders: true,
+  legacyHeaders: false,
+  keyGenerator: limitKey,
+  message: LIMIT_MESSAGE,
+});
+
 // ── identity ────────────────────────────────────────────────────────────────
 // No passwords: each install generates a stable device id and sends it as a
 // header. Enough to tell two real testers apart; swap for real auth later.
-type User = { id: string; name: string; initial: string; avatar_bg: string; last_seen: string };
+type User = { id: string; name: string; initial: string; avatar_bg: string; avatar_url: string | null; last_seen: string };
 
 declare global {
   // eslint-disable-next-line @typescript-eslint/no-namespace
@@ -45,11 +86,46 @@ app.get('/api/health', (_req, res) => res.json({ ok: true, service: 'reeffocus-a
 // ── names ───────────────────────────────────────────────────────────────────
 const NAME_RE = /^[\p{L}\p{N} ._-]{2,20}$/u;
 
+// ── name moderation ─────────────────────────────────────────────────────────
+// Leetspeak folds to letters before matching so "b1tch" and "$hit" don't slip
+// past the list; separators fold away too, which catches "f.u.c.k" spelled out.
+const LEET: Record<string, string> = { '0': 'o', '1': 'i', '3': 'e', '4': 'a', '5': 's', '7': 't', '@': 'a', '$': 's' };
+const foldLeet = (s: string) => s.toLowerCase().replace(/[013457@$]/g, (c) => LEET[c]);
+const collapse = (s: string) => foldLeet(s).replace(/[ ._-]+/g, '');
+
+// Two tiers, because the matching strength has to fit the term:
+//   BLOCK_ANYWHERE — unambiguous profanity/slurs that don't occur inside
+//                    innocent names, so a substring hit is enough to reject.
+//   BLOCK_EXACT    — short or name-adjacent terms that live inside real names
+//                    (ass in Cassandra, dick in Dickson, cock in Hitchcock);
+//                    these reject only when a whole word — or the whole name
+//                    with separators stripped — IS the term, never a substring.
+const BLOCK_ANYWHERE = [
+  'fuck', 'shit', 'bitch', 'cunt', 'whore', 'slut', 'wanker', 'asshole', 'arsehole',
+  'dickhead', 'jackass', 'dumbass', 'bullshit', 'motherfucker', 'cocksucker', 'pussy',
+  'bollocks', 'jerkoff', 'nigger', 'nigga', 'faggot', 'retard', 'kike', 'chink',
+  'wetback', 'raghead', 'tranny', 'beaner', 'gook',
+];
+const BLOCK_EXACT = [
+  'ass', 'arse', 'dick', 'cock', 'prick', 'tit', 'tits', 'cum', 'fag', 'twat',
+  'dyke', 'homo', 'coon', 'spic', 'paki', 'negro', 'spaz', 'piss',
+];
+
+/** True if the name should be rejected on content, after leetspeak folding. */
+function isProfaneName(raw: string): boolean {
+  const collapsed = collapse(raw);
+  if (BLOCK_ANYWHERE.some((t) => collapsed.includes(t))) return true;
+  const words = foldLeet(raw).split(/[ ._-]+/).filter(Boolean);
+  return BLOCK_EXACT.some((t) => collapsed === t || words.includes(t));
+}
+
 /** Returns an error string, or null if the name is well-formed. */
 function validateName(name: string): string | null {
   if (name.length < 2) return 'Name must be at least 2 characters.';
   if (name.length > 20) return 'Name must be 20 characters or fewer.';
   if (!NAME_RE.test(name)) return 'Use letters, numbers, spaces, . _ or - only.';
+  // Deliberately vague wording: naming the rule invites probing for gaps.
+  if (isProfaneName(name)) return 'Pick a different name.';
   return null;
 }
 
@@ -62,6 +138,7 @@ async function nameTaken(name: string, deviceId?: string) {
 
 app.get(
   '/api/name-check',
+  strictLimiter,
   asyncRoute(async (req, res) => {
     const name = String(req.query.name ?? '').trim();
     const deviceId = req.header('x-device-id') ?? undefined;
@@ -75,6 +152,7 @@ app.get(
 /** First launch: claim a user row for this device. Idempotent. */
 app.post(
   '/api/register',
+  strictLimiter,
   asyncRoute(async (req, res) => {
     const deviceId = String(req.body?.deviceId ?? '').trim();
     const name = String(req.body?.name ?? '').trim();
@@ -117,6 +195,144 @@ app.get(
   })
 );
 
+/**
+ * Delete the calling account and everything that hangs off it. Every child
+ * table (user_species, user_stats, friendships both directions, room_members,
+ * room_dives, trades on either side, reports on either side, rooms.host_id)
+ * references users(id) ON DELETE CASCADE — verified against production — so a
+ * single DELETE on users is the whole job and can't leave orphans behind.
+ * Note: a room this user *hosts* cascades away even with other members still
+ * inside. Accepted for beta — rooms are cheap to recreate, and a host-less
+ * room would break every query that joins rooms to its host.
+ */
+app.delete(
+  '/api/me',
+  requireUser,
+  asyncRoute(async (req, res) => {
+    await query('DELETE FROM users WHERE id = $1', [req.user!.id]);
+    res.json({ deleted: true });
+  })
+);
+
+/**
+ * Flag another diver for a human to look at. Deliberately minimal: no dedupe,
+ * no self-report guard — moderation reads the raw table and noise there is
+ * cheaper than a client contract with edge cases.
+ */
+app.post(
+  '/api/report',
+  requireUser,
+  asyncRoute(async (req, res) => {
+    const targetId = String(req.body?.targetId ?? '').trim();
+    // Reason is free text from a stranger — cap it so the table can't be used
+    // as a dumping ground.
+    const reason = req.body?.reason == null ? null : String(req.body.reason).slice(0, 500);
+    if (!targetId) return res.status(400).json({ error: 'targetId required' });
+
+    const target = await query('SELECT 1 FROM users WHERE id = $1', [targetId]);
+    if (!target.rows[0]) return res.status(404).json({ error: 'no such user' });
+
+    await query('INSERT INTO reports (id, reporter_id, target_id, reason) VALUES ($1,$2,$3,$4)', [
+      'rp' + randomUUID().slice(0, 8),
+      req.user!.id,
+      targetId,
+      reason,
+    ]);
+    res.status(201).json({ ok: true });
+  })
+);
+
+// ── blocking ────────────────────────────────────────────────────────────────
+/**
+ * A SQL predicate that hides any diver on either side of a block, for use in a
+ * query that already has the other diver's id in scope. `me` and `them` are the
+ * SQL expressions naming the two ids — usually a placeholder and a column.
+ *
+ * Symmetric on purpose: blocking is not just "hide them from me". If it only
+ * cut one direction, the blocked diver could still see, trade with and follow
+ * the person who blocked them, which is not what Guideline 1.2 asks for.
+ */
+const notBlocked = (me: string, them: string) => `
+  NOT EXISTS (
+    SELECT 1 FROM blocks b
+     WHERE (b.blocker_id = ${me} AND b.blocked_id = ${them})
+        OR (b.blocker_id = ${them} AND b.blocked_id = ${me})
+  )`;
+
+/**
+ * Block a diver. Also tears down the friendship in both directions — staying
+ * "friends" with someone you have blocked is a contradiction the rest of the
+ * app would have to keep special-casing. Idempotent, so the button can't fail
+ * by being pressed twice.
+ */
+app.post(
+  '/api/blocks',
+  strictLimiter,
+  requireUser,
+  asyncRoute(async (req, res) => {
+    const targetId = String(req.body?.targetId ?? '').trim();
+    const me = req.user!.id;
+    if (!targetId) return res.status(400).json({ error: 'targetId required' });
+    if (targetId === me) return res.status(400).json({ error: 'You cannot block yourself.' });
+
+    const target = await query('SELECT 1 FROM users WHERE id = $1', [targetId]);
+    if (!target.rows[0]) return res.status(404).json({ error: 'no such user' });
+
+    await tx(async (c) => {
+      await c.query(
+        `INSERT INTO blocks (blocker_id, blocked_id) VALUES ($1,$2)
+         ON CONFLICT (blocker_id, blocked_id) DO NOTHING`,
+        [me, targetId]
+      );
+      await c.query(
+        `DELETE FROM friendships
+          WHERE (user_id = $1 AND friend_id = $2) OR (user_id = $2 AND friend_id = $1)`,
+        [me, targetId]
+      );
+      // Cancel anything in flight between the two, so a blocked diver's pending
+      // offer can't sit in the other person's inbox after the block.
+      await c.query(
+        `UPDATE trades SET status = 'cancelled', resolved_at = now()
+          WHERE status = 'pending'
+            AND ((from_id = $1 AND to_id = $2) OR (from_id = $2 AND to_id = $1))`,
+        [me, targetId]
+      );
+    });
+    res.status(201).json({ ok: true });
+  })
+);
+
+/** Unblock. Does not restore the friendship — that has to be deliberate. */
+app.delete(
+  '/api/blocks/:id',
+  requireUser,
+  asyncRoute(async (req, res) => {
+    await query('DELETE FROM blocks WHERE blocker_id = $1 AND blocked_id = $2', [
+      req.user!.id,
+      String(req.params.id),
+    ]);
+    res.json({ ok: true });
+  })
+);
+
+/** Who this diver has blocked, so the app can offer an unblock list. */
+app.get(
+  '/api/blocks',
+  requireUser,
+  asyncRoute(async (req, res) => {
+    const r = await query(
+      `SELECT u.id, u.name, u.initial, u.avatar_bg
+         FROM blocks b JOIN users u ON u.id = b.blocked_id
+        WHERE b.blocker_id = $1
+        ORDER BY b.created_at DESC`,
+      [req.user!.id]
+    );
+    res.json(
+      r.rows.map((x: any) => ({ id: x.id, name: x.name, initial: x.initial, avatarBg: x.avatar_bg }))
+    );
+  })
+);
+
 /** Record a finished dive. The server owns the collection so trades are honest. */
 app.post(
   '/api/me/catch',
@@ -133,6 +349,12 @@ app.post(
             SET total_mins = total_mins + $2,
                 dives = dives + 1,
                 caught = caught + $3,
+                -- Weekly total: keep accruing within the current week, otherwise
+                -- start this week fresh from these minutes. date_trunc('week') is
+                -- the Monday 00:00 of the week, so everyone rolls over together.
+                week_mins = CASE WHEN week_start = date_trunc('week', now())::date
+                                 THEN week_mins + $2 ELSE $2 END,
+                week_start = date_trunc('week', now())::date,
                 updated_at = now()
           WHERE user_id = $1`,
         [me, mins, speciesId ? 1 : 0]
@@ -144,6 +366,14 @@ app.post(
   })
 );
 
+// Profile photos are deliberately not a v1 feature. An uploaded photo shown to
+// strangers on the leaderboard is user-generated content, and App Review
+// Guideline 1.2 requires a moderation path for that — object storage, a review
+// queue, and a User Content → Photos entry on the privacy label. The generated
+// initials tile carries no such burden, so the upload route is gone and
+// avatar_url is never read back out. The column is left in place so any rows
+// written during the beta stay recoverable if photos return with moderation.
+
 /**
  * Add a friend by diver name. Names are unique, so the name is the handle.
  * Symmetric: both of you see each other immediately, with no accept step —
@@ -151,6 +381,7 @@ app.post(
  */
 app.post(
   '/api/friends',
+  strictLimiter,
   requireUser,
   asyncRoute(async (req, res) => {
     const name = String(req.body?.name ?? '').trim();
@@ -163,6 +394,16 @@ app.post(
     const other = found.rows[0];
     if (!other) return res.status(404).json({ error: `No diver called “${name}”.` });
     if (other.id === req.user!.id) return res.status(400).json({ error: 'That’s you.' });
+
+    // Either direction of a block stops the add. The message is the same as the
+    // not-found one on purpose: telling someone "they blocked you" hands a
+    // harasser a confirmation, and telling them nothing costs an honest user
+    // nothing, since they can only reach this by typing an exact diver name.
+    const blocked = await query(
+      `SELECT 1 WHERE NOT ${notBlocked('$1', '$2')}`,
+      [req.user!.id, other.id]
+    );
+    if (blocked.rows[0]) return res.status(404).json({ error: `No diver called “${name}”.` });
 
     await tx(async (c) => {
       await c.query(
@@ -192,6 +433,7 @@ app.get(
          LEFT JOIN user_species sp ON sp.user_id = u.id
         WHERE u.id <> $1
           AND EXISTS (SELECT 1 FROM friendships f WHERE f.user_id = $1 AND f.friend_id = u.id)
+          AND ${notBlocked('$1', 'u.id')}
         GROUP BY u.id, s.total_mins, s.dives
         ORDER BY u.last_seen DESC`,
       [req.user!.id]
@@ -231,11 +473,17 @@ app.get(
   '/api/leaderboard',
   requireUser,
   asyncRoute(async (req, res) => {
+    // The board is this week's focus, and it resets every Monday for everyone.
+    // A diver whose week_start isn't the current week counts as zero this week —
+    // so the reset is implicit and needs no scheduled job to wipe the table.
     const r = await query(
-      `SELECT u.id, u.name, u.initial, u.avatar_bg, COALESCE(s.total_mins,0) AS total_mins
+      `SELECT u.id, u.name, u.initial, u.avatar_bg,
+              CASE WHEN s.week_start = date_trunc('week', now())::date
+                   THEN COALESCE(s.week_mins, 0) ELSE 0 END AS week_mins
          FROM users u LEFT JOIN user_stats s ON s.user_id = u.id
-        ORDER BY total_mins DESC LIMIT 25`,
-      []
+        WHERE ${notBlocked('$1', 'u.id')}
+        ORDER BY week_mins DESC, u.last_seen DESC LIMIT 25`,
+      [req.user!.id]
     );
     const medal = ['#FFD700', '#8fa8b5', '#c98b4a'];
     res.json(
@@ -244,7 +492,7 @@ app.get(
         name: x.id === req.user!.id ? `${x.name} (you)` : x.name,
         initial: x.initial,
         avatarBg: x.avatar_bg,
-        time: `${Math.floor(Number(x.total_mins) / 60)}h ${Number(x.total_mins) % 60}m`,
+        time: `${Math.floor(Number(x.week_mins) / 60)}h ${Number(x.week_mins) % 60}m`,
         rankFg: medal[i] ?? '#8fa8b5',
         you: x.id === req.user!.id,
       }))
@@ -316,6 +564,9 @@ app.post(
     const schedule = String(req.body?.schedule ?? 'daily');
 
     if (!name) return res.status(400).json({ error: 'Give the room a name.' });
+    // A room name shows on every member's screen, so it goes through the same
+    // moderation gate as diver names.
+    if (isProfaneName(name)) return res.status(400).json({ error: 'Pick a different name.' });
     if (kind !== 'room' && kind !== 'expedition') return res.status(400).json({ error: 'Unknown room kind.' });
     if (schedule !== 'daily' && schedule !== 'once') return res.status(400).json({ error: 'Unknown schedule.' });
 
@@ -470,6 +721,10 @@ app.post(
     if (!toId || !giveId || !getId) return res.status(400).json({ error: 'toId, giveId, getId required' });
     if (toId === me) return res.status(400).json({ error: 'cannot trade with yourself' });
 
+    // A block cuts contact, and an unsolicited trade offer is contact.
+    const blocked = await query(`SELECT 1 WHERE NOT ${notBlocked('$1', '$2')}`, [me, toId]);
+    if (blocked.rows[0]) return res.status(403).json({ error: 'You can’t trade with that diver.' });
+
     const mine = await collectionOf(me);
     const theirs = await collectionOf(toId);
     if ((mine[giveId] ?? 0) < 2) return res.status(400).json({ error: 'you need a spare of that species to offer it' });
@@ -542,6 +797,25 @@ app.get('/api/ocean-fact', (_req, res) => {
   });
 });
 
+// ── legal pages ─────────────────────────────────────────────────────────────
+// Resolved relative to this file, not the working directory, so the same path
+// works from src/ under tsx and from dist/ under node — both sit one level
+// below the server root, next to public/.
+const PUBLIC_DIR = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..', 'public');
+
+const legalPage = (file: string) => (_req: Request, res: Response) => {
+  res.sendFile(path.join(PUBLIC_DIR, file), (err) => {
+    // The HTML ships separately from the code; until it lands, answer plainly
+    // rather than surfacing a filesystem error to app-store reviewers.
+    if (err && !res.headersSent) res.status(404).type('text/plain').send('coming soon');
+  });
+};
+
+// Public on purpose: app-store review and signed-out users must be able to
+// read these, so no requireUser and no strict limiter.
+app.get('/privacy', legalPage('privacy.html'));
+app.get('/terms', legalPage('terms.html'));
+
 // ── errors ──────────────────────────────────────────────────────────────────
 app.use((err: any, _req: Request, res: Response, _next: NextFunction) => {
   const status = err?.status ?? 500;
@@ -551,7 +825,7 @@ app.use((err: any, _req: Request, res: Response, _next: NextFunction) => {
 
 initSchema()
   .then(() => {
-    app.listen(PORT, () => console.log(`ReefFocus API listening on http://0.0.0.0:${PORT}`));
+    app.listen(PORT, () => console.log(`Reefy API listening on http://0.0.0.0:${PORT}`));
   })
   .catch((e) => {
     console.error('[reeffocus-api] failed to init schema:', e.message);

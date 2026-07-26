@@ -14,6 +14,9 @@ COPY package*.json ./
 # only runtime deps — tsx/typescript stay out of the image
 RUN npm ci --omit=dev
 COPY --from=build /app/dist ./dist
+# The legal pages are served from disk at /privacy and /terms. Apple crawls
+# both before review, so they have to be in the image, not just in the repo.
+COPY public ./public
 # hosts inject PORT; the server reads it and falls back to 4000
 EXPOSE 4000
 CMD ["node", "dist/index.js"]
