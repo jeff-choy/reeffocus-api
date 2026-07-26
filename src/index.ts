@@ -783,6 +783,9 @@ const legalPage = (file: string) => (_req: Request, res: Response) => {
 // read these, so no requireUser and no strict limiter.
 app.get('/privacy', legalPage('privacy.html'));
 app.get('/terms', legalPage('terms.html'));
+// App Store Connect requires a Support URL, and Guideline 1.2 requires a
+// published way to contact someone about another user's behaviour. This is both.
+app.get('/support', legalPage('support.html'));
 
 // ── errors ──────────────────────────────────────────────────────────────────
 app.use((err: any, _req: Request, res: Response, _next: NextFunction) => {
