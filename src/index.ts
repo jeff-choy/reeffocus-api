@@ -6,6 +6,7 @@ import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import 'dotenv/config';
 import { query, tx, initSchema, collectionOf, addSpecies, pool } from './db.js';
+import { isProfaneName } from './moderation.js';
 
 const app = express();
 app.use(cors());
@@ -85,39 +86,6 @@ app.get('/api/health', (_req, res) => res.json({ ok: true, service: 'reeffocus-a
 
 // ── names ───────────────────────────────────────────────────────────────────
 const NAME_RE = /^[\p{L}\p{N} ._-]{2,20}$/u;
-
-// ── name moderation ─────────────────────────────────────────────────────────
-// Leetspeak folds to letters before matching so "b1tch" and "$hit" don't slip
-// past the list; separators fold away too, which catches "f.u.c.k" spelled out.
-const LEET: Record<string, string> = { '0': 'o', '1': 'i', '3': 'e', '4': 'a', '5': 's', '7': 't', '@': 'a', '$': 's' };
-const foldLeet = (s: string) => s.toLowerCase().replace(/[013457@$]/g, (c) => LEET[c]);
-const collapse = (s: string) => foldLeet(s).replace(/[ ._-]+/g, '');
-
-// Two tiers, because the matching strength has to fit the term:
-//   BLOCK_ANYWHERE — unambiguous profanity/slurs that don't occur inside
-//                    innocent names, so a substring hit is enough to reject.
-//   BLOCK_EXACT    — short or name-adjacent terms that live inside real names
-//                    (ass in Cassandra, dick in Dickson, cock in Hitchcock);
-//                    these reject only when a whole word — or the whole name
-//                    with separators stripped — IS the term, never a substring.
-const BLOCK_ANYWHERE = [
-  'fuck', 'shit', 'bitch', 'cunt', 'whore', 'slut', 'wanker', 'asshole', 'arsehole',
-  'dickhead', 'jackass', 'dumbass', 'bullshit', 'motherfucker', 'cocksucker', 'pussy',
-  'bollocks', 'jerkoff', 'nigger', 'nigga', 'faggot', 'retard', 'kike', 'chink',
-  'wetback', 'raghead', 'tranny', 'beaner', 'gook',
-];
-const BLOCK_EXACT = [
-  'ass', 'arse', 'dick', 'cock', 'prick', 'tit', 'tits', 'cum', 'fag', 'twat',
-  'dyke', 'homo', 'coon', 'spic', 'paki', 'negro', 'spaz', 'piss',
-];
-
-/** True if the name should be rejected on content, after leetspeak folding. */
-function isProfaneName(raw: string): boolean {
-  const collapsed = collapse(raw);
-  if (BLOCK_ANYWHERE.some((t) => collapsed.includes(t))) return true;
-  const words = foldLeet(raw).split(/[ ._-]+/).filter(Boolean);
-  return BLOCK_EXACT.some((t) => collapsed === t || words.includes(t));
-}
 
 /** Returns an error string, or null if the name is well-formed. */
 function validateName(name: string): string | null {
