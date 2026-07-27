@@ -132,11 +132,24 @@ const asyncRoute =
 
 const AVATARS = ['#9fd9d3', '#FFB5A7', '#FFD700', '#bfdde6', '#4FC3D9', '#4ADE80', '#FF8C69'];
 
-// `mail` is here so a deploy can be checked without sending anything: it is the
-// one way to confirm RESEND_API_KEY actually reached the running process, which
-// is otherwise only discoverable by a user not receiving their signup email.
+// `mail` and `baseUrl` are here so a deploy can be checked without sending
+// anything. Both are otherwise only discoverable by a user not receiving their
+// signup email, or receiving one whose link goes nowhere.
+//
+// `baseUrl` is the host that verification links are built from. It is reported
+// because setting it to a domain that does not serve the app yet is a silent,
+// entirely plausible mistake — the app keeps working, signup keeps working, and
+// only the emailed link is dead. Not a secret: it is a public URL, and the
+// value is echoed rather than the environment variable's presence, because
+// "set" and "set correctly" are different questions.
 app.get('/api/health', (_req, res) =>
-  res.json({ ok: true, service: 'reefie-api', mail: mailConfigured, time: Date.now() })
+  res.json({
+    ok: true,
+    service: 'reefie-api',
+    mail: mailConfigured,
+    baseUrl: process.env.PUBLIC_BASE_URL ?? null,
+    time: Date.now(),
+  })
 );
 
 // ── names ───────────────────────────────────────────────────────────────────
