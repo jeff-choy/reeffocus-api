@@ -20,6 +20,7 @@ import {
   verifyPassword,
 } from './auth.js';
 import { canSendMail, mailConfigured, sendMail, verificationEmail } from './mail.js';
+import { verifyAppleIdentityToken } from './appleToken.js';
 
 const app = express();
 app.use(cors());
@@ -363,23 +364,142 @@ app.post(
  * failed probe is safe.
  */
 /**
- * Sign in with Apple. Off until the Apple Developer Program enrolment (B1)
- * exists: the capability is enabled on the App ID in the developer portal, and
- * verifying the identity token server-side needs a Services ID and a key that
- * only a paid account can create.
+ * Sign in with Apple.
  *
- * Flipping this to true is not enough on its own — the route below has to be
- * implemented first. It is a named constant so the two can't drift apart
- * silently, and so `/api/auth/methods` never advertises something that 501s.
+ * This was previously a 501 stub, on the belief that verifying Apple's identity
+ * token needed a Services ID and private key only a paid developer account
+ * could create. That was wrong, and worth recording: those belong to the *web*
+ * sign-in flow and the token-revocation endpoint. A **native iOS** token is
+ * verified against Apple's *public* keys, so this needed no secrets and could
+ * have been built at any point. See src/appleToken.ts.
+ *
+ * What genuinely does require the developer account is the Sign In with Apple
+ * capability on the App ID — a build-time entitlement, not a server concern.
+ *
+ * The flag stays, because `/api/auth/methods` must never advertise a method the
+ * app cannot complete: the entitlement has to be enabled and shipped in a build
+ * before this is worth showing.
  */
-const APPLE_SIGN_IN_READY = false;
+const APPLE_SIGN_IN_READY = process.env.APPLE_SIGN_IN_READY === 'true';
+
+/** Must match app.json's ios.bundleIdentifier exactly — it is the `aud` claim. */
+const APPLE_BUNDLE_ID = process.env.APPLE_BUNDLE_ID ?? 'com.jeffchoy.reefie';
 
 app.get('/api/auth/methods', (_req, res) =>
   res.json({ email: true, apple: APPLE_SIGN_IN_READY })
 );
 
-app.post('/api/auth/apple', strictLimiter, (_req, res) =>
-  res.status(501).json({ error: 'Sign in with Apple isn’t available yet.', unavailable: true })
+/**
+ * Find a free diver name.
+ *
+ * Apple returns the user's full name **only on the very first authorisation**
+ * for an Apple ID, and never again — so it is a hint, not an identity. Names
+ * are unique server-side, which means a first-time Apple sign-in can collide
+ * with an existing diver through no fault of the person signing in. Failing the
+ * sign-in for that would be indefensible, so this always terminates with
+ * *something* usable.
+ */
+async function uniqueDiverName(preferred?: string): Promise<string> {
+  const base = (preferred ?? '').trim().slice(0, 20).trim();
+  if (base && !validateName(base) && !(await nameTaken(base))) return base;
+
+  // Try the hinted name with a numeric suffix before abandoning it, so
+  // "Jeff" becomes "Jeff 2" rather than something unrecognisable.
+  if (base) {
+    const stem = base.slice(0, 16).trim();
+    for (let i = 2; i <= 9; i++) {
+      const candidate = `${stem} ${i}`;
+      if (!validateName(candidate) && !(await nameTaken(candidate))) return candidate;
+    }
+  }
+
+  // Random fallback. Bounded retries, then a timestamp tail that cannot
+  // realistically collide — this function must not be able to loop forever.
+  for (let i = 0; i < 20; i++) {
+    const candidate = `Diver ${Math.floor(1000 + Math.random() * 9000)}`;
+    if (!(await nameTaken(candidate))) return candidate;
+  }
+  return `Diver ${Date.now().toString().slice(-8)}`;
+}
+
+app.post(
+  '/api/auth/apple',
+  strictLimiter,
+  asyncRoute(async (req, res) => {
+    if (!APPLE_SIGN_IN_READY) {
+      return res.status(501).json({ error: 'Sign in with Apple isn’t available yet.', unavailable: true });
+    }
+
+    const identityToken = String(req.body?.identityToken ?? '');
+    if (!identityToken) return res.status(400).json({ error: 'Missing Apple sign-in token.' });
+
+    let identity;
+    try {
+      identity = await verifyAppleIdentityToken(identityToken, APPLE_BUNDLE_ID);
+    } catch (e) {
+      // Log the reason; tell the caller nothing that helps forge a better token.
+      console.error('[reefie-api] apple token rejected:', (e as Error).message);
+      return res.status(401).json({ error: 'That Apple sign-in couldn’t be verified. Try again.' });
+    }
+
+    const email = identity.email ? normaliseEmail(identity.email) : null;
+
+    // 1. Known Apple account — the ordinary path after the first sign-in.
+    const existing = await query<User>(`SELECT ${USER_COLS} FROM users WHERE apple_sub = $1`, [identity.sub]);
+    if (existing.rows[0]) return sessionResponse(res, existing.rows[0]);
+
+    // 2. First Apple sign-in, but the address already has a Reefie account.
+    //    Link them rather than creating a second account for the same person.
+    //    Gated on Apple vouching for the address: linking on an *unverified*
+    //    email would let anyone who can assert an address take over the account
+    //    that owns it. Private-relay addresses are verified by definition, so
+    //    this costs nothing in the common case.
+    if (email && identity.emailVerified) {
+      const byEmail = await query<User>(
+        `UPDATE users SET apple_sub = $1
+          WHERE LOWER(email) = $2 AND apple_sub IS NULL
+      RETURNING ${USER_COLS}`,
+        [identity.sub, email]
+      );
+      if (byEmail.rows[0]) return sessionResponse(res, byEmail.rows[0]);
+    }
+
+    // 3. Brand-new account. No password: this account signs in through Apple.
+    const id = randomUUID();
+    const name = await uniqueDiverName(String(req.body?.name ?? ''));
+    try {
+      await tx(async (c) => {
+        await c.query(
+          `INSERT INTO users (id, name, initial, avatar_bg, email, apple_sub, email_verified_at)
+           VALUES ($1, $2, $3, $4, $5, $6, $7)`,
+          [
+            id,
+            name,
+            name[0].toUpperCase(),
+            avatarFor(identity.sub),
+            email,
+            identity.sub,
+            // Apple has already proven the address, so re-confirming it by
+            // email would be theatre — and would nag about an address the user
+            // may have deliberately hidden behind a relay.
+            identity.emailVerified ? new Date() : null,
+          ]
+        );
+        await c.query('INSERT INTO user_stats (user_id) VALUES ($1)', [id]);
+      });
+    } catch (e: any) {
+      if (e?.code === '23505') {
+        // Two devices racing the same first sign-in. The row the other one
+        // created is the right answer.
+        const raced = await query<User>(`SELECT ${USER_COLS} FROM users WHERE apple_sub = $1`, [identity.sub]);
+        if (raced.rows[0]) return sessionResponse(res, raced.rows[0]);
+      }
+      throw e;
+    }
+
+    const created = await query<User>(`SELECT ${USER_COLS} FROM users WHERE id = $1`, [id]);
+    await sessionResponse(res, created.rows[0]);
+  })
 );
 
 // ── email verification ──────────────────────────────────────────────────────
