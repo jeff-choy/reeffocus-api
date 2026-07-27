@@ -6,9 +6,19 @@
  * connection pool and no supply-chain surface — the same reasoning that put
  * scrypt in auth.ts instead of bcrypt.
  *
- * Mail goes out as `admin@reefie.io`, from the reefie.io domain verified in
- * Resend. That verification is the whole ballgame, and it is worth recording
- * why rather than treating it as setup trivia.
+ * Mail goes out as `support@reefie.io`, from the reefie.io domain verified in
+ * Resend.
+ *
+ * Sending address and support address are deliberately the same one. Resend
+ * does not need a mailbox to send — delivery is authorised by the domain's
+ * DKIM/SPF records, not by the local part existing — so a `noreply@` that
+ * nobody reads would have worked just as well technically. It would also mean
+ * every reply to a verification email vanished, and "reply to the email you
+ * were sent" is what people actually do. Pointing the From at the one real
+ * mailbox costs nothing and makes that work.
+ *
+ * The domain verification is the whole ballgame, and it is worth recording why
+ * rather than treating it as setup trivia.
  *
  * Resend permits its shared `onboarding@resend.dev` address to deliver *only to
  * the email the Resend account was registered with*. That is not a reputation
