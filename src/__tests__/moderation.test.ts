@@ -2,7 +2,7 @@ import { test, describe } from 'node:test';
 import assert from 'node:assert/strict';
 import { isProfaneName } from '../moderation.js';
 
-// Name moderation is the one content filter Reefy has, and Guideline 1.2 counts
+// Name moderation is the one content filter Reefie has, and Guideline 1.2 counts
 // on it. The interesting property is not "does it catch swear words" but the
 // balance: it has to catch deliberate evasion without rejecting real people's
 // names. Both failure directions are user-visible and one of them is offensive.

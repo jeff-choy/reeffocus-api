@@ -136,7 +136,7 @@ const AVATARS = ['#9fd9d3', '#FFB5A7', '#FFD700', '#bfdde6', '#4FC3D9', '#4ADE80
 // one way to confirm RESEND_API_KEY actually reached the running process, which
 // is otherwise only discoverable by a user not receiving their signup email.
 app.get('/api/health', (_req, res) =>
-  res.json({ ok: true, service: 'reeffocus-api', mail: mailConfigured, time: Date.now() })
+  res.json({ ok: true, service: 'reefie-api', mail: mailConfigured, time: Date.now() })
 );
 
 // ── names ───────────────────────────────────────────────────────────────────
@@ -291,7 +291,7 @@ app.post(
     // provider must not turn a successful signup into an error the user reads
     // as "it didn't work". They land in the app; the banner offers Resend.
     void sendVerification(req, { id, name, email }).catch((e) =>
-      console.error('[reeffocus-api] verification send failed:', e.message)
+      console.error('[reefie-api] verification send failed:', e.message)
     );
 
     await sessionResponse(res, u.rows[0]);
@@ -388,8 +388,17 @@ app.post(
       // shows this verbatim, so it has to be true.
       return res.status(503).json({ error: 'We can’t send email right now. Try again later.' });
     }
-    // Here the send *is* the action, so unlike signup a failure is the answer.
-    await sendVerification(req, { id: user.id, name: user.name, email: user.email });
+    // Here the send *is* the action, so unlike signup a failure is the answer —
+    // but it has to be *our* answer. Letting this throw to the global handler
+    // returned the provider's raw body verbatim, so a misconfigured sending
+    // domain surfaced in the app as an alert containing Resend's JSON. Keep the
+    // detail in the logs, where it is useful, and give the user a sentence.
+    try {
+      await sendVerification(req, { id: user.id, name: user.name, email: user.email });
+    } catch (e) {
+      console.error('[reefie-api] verification resend failed:', (e as Error).message);
+      return res.status(502).json({ error: 'We couldn’t send that email just now. Try again in a moment.' });
+    }
     res.json({ sent: true, alreadyVerified: false });
   })
 );
@@ -424,7 +433,7 @@ app.get(
         .send(
           verifyPage(
             'This link has expired',
-            `Verification links last ${VERIFY_HOURS} hours. Open Reefy and tap “Resend” to get a fresh one.`
+            `Verification links last ${VERIFY_HOURS} hours. Open Reefie and tap “Resend” to get a fresh one.`
           )
         );
     }
@@ -442,10 +451,10 @@ app.get(
       return res
         .status(400)
         .type('html')
-        .send(verifyPage('That address has changed', 'Open Reefy and tap “Resend” to confirm your current email.'));
+        .send(verifyPage('That address has changed', 'Open Reefie and tap “Resend” to confirm your current email.'));
     }
 
-    res.type('html').send(verifyPage('Email confirmed', 'You can close this and go back to Reefy. Happy diving.'));
+    res.type('html').send(verifyPage('Email confirmed', 'You can close this and go back to Reefie. Happy diving.'));
   })
 );
 
@@ -455,7 +464,7 @@ function verifyPage(title: string, body: string): string {
   return `<!doctype html>
 <html lang="en"><head>
 <meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
-<title>${esc(title)} · Reefy</title>
+<title>${esc(title)} · Reefie</title>
 <style>
   body { margin:0; min-height:100vh; display:grid; place-items:center; padding:24px;
          background:#0A2540; color:#F0F7FA;
@@ -1139,16 +1148,16 @@ app.get('/support', legalPage('support.html'));
 // ── errors ──────────────────────────────────────────────────────────────────
 app.use((err: any, _req: Request, res: Response, _next: NextFunction) => {
   const status = err?.status ?? 500;
-  if (status >= 500) console.error('[reeffocus-api]', err);
+  if (status >= 500) console.error('[reefie-api]', err);
   res.status(status).json({ error: err?.message ?? 'server error' });
 });
 
 initSchema()
   .then(() => {
-    app.listen(PORT, () => console.log(`Reefy API listening on http://0.0.0.0:${PORT}`));
+    app.listen(PORT, () => console.log(`Reefie API listening on http://0.0.0.0:${PORT}`));
   })
   .catch((e) => {
-    console.error('[reeffocus-api] failed to init schema:', e.message);
+    console.error('[reefie-api] failed to init schema:', e.message);
     process.exit(1);
   });
 

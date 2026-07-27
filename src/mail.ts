@@ -6,26 +6,30 @@
  * connection pool and no supply-chain surface — the same reasoning that put
  * scrypt in auth.ts instead of bcrypt.
  *
- * The default sender is Resend's shared `onboarding@resend.dev`, and it is a
- * development fallback only — **not** something that can ship.
+ * Mail goes out as `admin@reefie.io`, from the reefie.io domain verified in
+ * Resend. That verification is the whole ballgame, and it is worth recording
+ * why rather than treating it as setup trivia.
  *
- * Resend permits that address to deliver *only to the email the Resend account
- * was registered with*. It is not a reputation caveat, it is a hard delivery
- * rule: with it in place, the developer receives verification emails and every
- * real user silently receives nothing. Signup would still appear to work,
- * because confirmation is soft-gated — which is precisely what makes the
- * failure quiet enough to reach production unnoticed.
+ * Resend permits its shared `onboarding@resend.dev` address to deliver *only to
+ * the email the Resend account was registered with*. That is not a reputation
+ * caveat, it is a hard delivery rule — with it in place the developer receives
+ * verification emails and every real user silently receives nothing, while
+ * signup still appears to work, because confirmation is soft-gated. Precisely
+ * the sort of failure quiet enough to reach production unnoticed.
  *
- * So MAIL_FROM must point at a domain verified in Resend before launch. There
- * is no way to send from a gmail.com (or other free-provider) address either:
- * verification requires publishing DKIM/SPF records in the sending domain's
- * DNS, which nobody can do for gmail.com, and Gmail's own DMARC policy
- * instructs receivers to reject such mail.
+ * A free-provider address is not an alternative either: verification requires
+ * publishing DKIM/SPF records in the sending domain's DNS, which nobody can do
+ * for gmail.com, and Gmail's own DMARC policy instructs receivers to reject
+ * such mail.
+ *
+ * The fallback below therefore stays deliberately broken-ish: it is the shared
+ * address, so a deploy that forgets MAIL_FROM sends only to the account owner
+ * rather than silently sending to nobody from a plausible-looking address.
  */
 
 const RESEND_ENDPOINT = 'https://api.resend.com/emails';
 const API_KEY = process.env.RESEND_API_KEY ?? '';
-const FROM = process.env.MAIL_FROM ?? 'Reefy <onboarding@resend.dev>';
+const FROM = process.env.MAIL_FROM ?? 'Reefie <onboarding@resend.dev>';
 
 /** Is a real provider wired up? Reported by /api/health, not by feature routes. */
 export const mailConfigured = !!API_KEY;
@@ -81,16 +85,16 @@ export async function sendMail(mail: Mail): Promise<void> {
 
 export function verificationEmail(name: string, link: string): Omit<Mail, 'to'> {
   return {
-    subject: 'Confirm your email for Reefy',
+    subject: 'Confirm your email for Reefie',
     text: [
       `Hi ${name},`,
       '',
-      'Confirm your email address to secure your Reefy account:',
+      'Confirm your email address to secure your Reefie account:',
       link,
       '',
-      'The link works for 24 hours. If it expires, open Reefy and tap Resend.',
+      'The link works for 24 hours. If it expires, open Reefie and tap Resend.',
       '',
-      "If you didn't create a Reefy account, you can ignore this — nothing will happen.",
+      "If you didn't create a Reefie account, you can ignore this — nothing will happen.",
     ].join('\n'),
     html: `
 <div style="font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',Helvetica,Arial,sans-serif;background:#0A2540;padding:32px 16px;">
@@ -106,10 +110,10 @@ export function verificationEmail(name: string, link: string): Omit<Mail, 'to'> 
       Confirm email
     </a>
     <p style="margin:20px 0 0;font-size:13px;line-height:19px;color:#5b7484;">
-      The link works for 24 hours. If it expires, open Reefy and tap Resend.
+      The link works for 24 hours. If it expires, open Reefie and tap Resend.
     </p>
     <p style="margin:12px 0 0;font-size:13px;line-height:19px;color:#5b7484;">
-      If you didn't create a Reefy account, ignore this email — nothing will happen.
+      If you didn't create a Reefie account, ignore this email — nothing will happen.
     </p>
   </div>
 </div>`.trim(),
