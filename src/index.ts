@@ -1,7 +1,7 @@
 import express, { NextFunction, Request, Response } from 'express';
 import cors from 'cors';
 import { rateLimit, ipKeyGenerator } from 'express-rate-limit';
-import { randomUUID } from 'node:crypto';
+import { randomUUID, timingSafeEqual } from 'node:crypto';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import 'dotenv/config';
@@ -21,6 +21,7 @@ import {
 } from './auth.js';
 import { canSendMail, mailConfigured, sendMail, verificationEmail } from './mail.js';
 import { verifyAppleIdentityToken } from './appleToken.js';
+import { effectOf, type RcEvent } from './revenuecat.js';
 
 const app = express();
 app.use(cors());
@@ -609,12 +610,117 @@ function verifyPage(title: string, body: string): string {
 </head><body><main><h1>${esc(title)}</h1><p>${esc(body)}</p></main></body></html>`;
 }
 
+/**
+ * The account's paid state, as the server understands it.
+ *
+ * `purchasedPearls` is a running total of every consumable ever credited, not a
+ * balance — pearls are also earned by diving, and that half lives on the phone.
+ * The client tracks how much of this total it has already added locally and
+ * applies the difference, which makes the pull idempotent and means a reinstall
+ * restores pearls the user actually paid for.
+ */
+async function entitlementsOf(userId: string) {
+  const u = await query<{ pro_until: string | null; pro_lifetime: boolean }>(
+    'SELECT pro_until, pro_lifetime FROM users WHERE id = $1',
+    [userId]
+  );
+  const row = u.rows[0];
+  const p = await query<{ total: string | null }>(
+    'SELECT SUM(pearls)::text AS total FROM pearl_grants WHERE user_id = $1',
+    [userId]
+  );
+  const proUntil = row?.pro_until ? new Date(row.pro_until) : null;
+  return {
+    pro: !!row?.pro_lifetime || (!!proUntil && proUntil.getTime() > Date.now()),
+    proLifetime: !!row?.pro_lifetime,
+    proUntil: row?.pro_until ?? null,
+    purchasedPearls: Number(p.rows[0]?.total ?? 0),
+  };
+}
+
 app.get(
   '/api/me',
   requireUser,
   asyncRoute(async (req, res) => {
     const stats = await query('SELECT * FROM user_stats WHERE user_id = $1', [req.user!.id]);
-    res.json({ user: req.user, collection: await collectionOf(req.user!.id), stats: stats.rows[0] ?? null });
+    res.json({
+      user: req.user,
+      collection: await collectionOf(req.user!.id),
+      stats: stats.rows[0] ?? null,
+      entitlements: await entitlementsOf(req.user!.id),
+    });
+  })
+);
+
+// ── RevenueCat webhook ──────────────────────────────────────────────────────
+// Receipts are validated by RevenueCat and the outcome is pushed here, so the
+// server has its own answer about who has paid for what. The client keeps its
+// optimistic grant — a paywall that waits on a webhook feels broken — but the
+// next sync overwrites whatever the phone believed.
+
+/**
+ * Shared secret configured in the RevenueCat dashboard and sent as the
+ * Authorization header. Without it set, the endpoint refuses everything:
+ * an unauthenticated route that grants paid entitlements is worse than no
+ * route at all, so failing closed is the only safe default.
+ */
+const RC_WEBHOOK_SECRET = process.env.REVENUECAT_WEBHOOK_SECRET ?? '';
+
+app.post(
+  '/webhooks/revenuecat',
+  asyncRoute(async (req, res) => {
+    if (!RC_WEBHOOK_SECRET) {
+      console.error('[reefie-api] revenuecat webhook hit but REVENUECAT_WEBHOOK_SECRET is unset');
+      return res.status(503).json({ error: 'not configured' });
+    }
+    // Constant-time compare: a plain !== leaks the secret one byte at a time to
+    // anyone willing to measure, and this header is the only thing guarding a
+    // route that hands out paid entitlements.
+    const provided = req.header('authorization') ?? '';
+    const a = Buffer.from(provided);
+    const b = Buffer.from(RC_WEBHOOK_SECRET);
+    if (a.length !== b.length || !timingSafeEqual(a, b)) {
+      return res.status(401).json({ error: 'unauthorized' });
+    }
+
+    const event: RcEvent = req.body?.event ?? {};
+    // RevenueCat is told to use the Reefie account id as its app user id (see
+    // Reefie/src/purchases.ts). original_app_user_id is the fallback for events
+    // that predate an alias.
+    const userId = event.app_user_id || event.original_app_user_id || '';
+    if (!userId) return res.status(200).json({ ok: true, ignored: 'no app_user_id' });
+
+    const effect = effectOf(event);
+
+    try {
+      if (effect.kind === 'pro') {
+        await query('UPDATE users SET pro_until = $1, pro_lifetime = pro_lifetime OR $2 WHERE id = $3', [
+          effect.until,
+          effect.lifetime,
+          userId,
+        ]);
+      } else if (effect.kind === 'pearls') {
+        // ON CONFLICT DO NOTHING is the idempotency. RevenueCat retries, and a
+        // repeat delivery must not pay out twice.
+        await query(
+          `INSERT INTO pearl_grants (transaction_id, user_id, product_id, pearls)
+           VALUES ($1, $2, $3, $4) ON CONFLICT (transaction_id) DO NOTHING`,
+          [effect.transactionId, userId, effect.productId, effect.pearls]
+        );
+      }
+    } catch (e: any) {
+      // A webhook for an account that does not exist here (deleted, or a
+      // sandbox tester) is not an error worth retrying — 200 stops RevenueCat
+      // redelivering something that can never succeed.
+      if (e?.code === '23503') {
+        return res.status(200).json({ ok: true, ignored: 'unknown account' });
+      }
+      throw e;
+    }
+
+    // Always 2xx quickly. A non-2xx puts the event into RevenueCat's retry
+    // queue, which is right for a transient fault and wrong for everything else.
+    res.status(200).json({ ok: true, applied: effect.kind, reason: (effect as any).reason });
   })
 );
 

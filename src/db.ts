@@ -291,6 +291,32 @@ export async function initSchema() {
     );
     CREATE INDEX IF NOT EXISTS email_verifications_user ON email_verifications(user_id);
 
+    -- ── entitlements ──────────────────────────────────────────────────────
+    -- Pro and purchased pearls used to live only on the phone, which meant the
+    -- client was the source of truth for something people pay money for — a
+    -- boolean in local storage anyone could flip. RevenueCat validates the
+    -- receipt and posts here; these columns are what it writes to.
+    --
+    -- Two columns rather than one because a subscription and a one-off are
+    -- different facts: pro_until is when an auto-renewing subscription lapses,
+    -- pro_lifetime never lapses. Encoding lifetime as a far-future date would
+    -- work until someone had to explain why an account expires in the year 9999.
+    ALTER TABLE users ADD COLUMN IF NOT EXISTS pro_until    TIMESTAMPTZ;
+    ALTER TABLE users ADD COLUMN IF NOT EXISTS pro_lifetime BOOLEAN NOT NULL DEFAULT false;
+
+    -- One row per purchased pearl bundle, keyed by the store transaction.
+    -- The primary key IS the idempotency: RevenueCat retries webhooks and can
+    -- deliver the same event more than once, so a repeat insert conflicts and
+    -- does nothing rather than crediting the pearls twice.
+    CREATE TABLE IF NOT EXISTS pearl_grants (
+      transaction_id TEXT PRIMARY KEY,
+      user_id        TEXT NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+      product_id     TEXT NOT NULL,
+      pearls         INTEGER NOT NULL CHECK (pearls > 0),
+      created_at     TIMESTAMPTZ NOT NULL DEFAULT now()
+    );
+    CREATE INDEX IF NOT EXISTS pearl_grants_user ON pearl_grants(user_id);
+
     -- ── retire the device-id divers ───────────────────────────────────────
     -- Before accounts, users.id *was* the install's device id and there were no
     -- credentials at all. Those rows cannot be signed into by anyone, ever, and
