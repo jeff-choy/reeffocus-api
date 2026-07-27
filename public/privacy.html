@@ -82,7 +82,7 @@
   <div class="wrap">
     <span class="brand"><span class="dot"></span> Reefy</span>
     <h1>Privacy Policy</h1>
-    <p class="dated">Effective date: 26 July 2026</p>
+    <p class="dated">Effective date: 27 July 2026</p>
   </div>
 </header>
 <main>
@@ -93,12 +93,13 @@
     remove it. We have tried to keep it short and honest.</p>
 
     <div class="callout">
-      <strong>The short version:</strong> Reefy has no accounts, no passwords,
-      and never asks for your email. We identify your device with a random ID so
-      the social features work. Reefy never asks for a photo and has no access to
-      your camera or photo library. You can delete everything from inside the app
-      at any time. We do not sell your data and there are no ads or third-party
-      trackers.
+      <strong>The short version:</strong> Reefy asks for an email address, a
+      password and a diver name, so your reef belongs to you rather than to one
+      phone. Your email is only ever used to confirm the address and to help you
+      get back in — never for marketing. Reefy never asks for a photo and has no
+      access to your camera or photo library. You can delete everything from
+      inside the app at any time. We do not sell your data and there are no ads
+      or third-party trackers.
     </div>
 
     <h2>Who we are</h2>
@@ -106,14 +107,32 @@
     this policy or your data, contact us at
     <a href="mailto:simhwa1001@gmail.com">simhwa1001@gmail.com</a>.</p>
 
-    <h2>No accounts, no email</h2>
-    <p>Reefy does not use sign-in. You do not create an account, you do not set a
-    password, and we do not collect your email address, phone number, real name,
-    or contacts. When you first open the app, your device generates a random
-    identifier (a UUID) that is sent to our server with the header
-    <code>x-device-id</code>. This ID lets the server recognise your device
-    across sessions so that your collection, friends, and rooms persist. It is
-    not linked to your Apple ID or to any real-world identity.</p>
+    <h2>Your account</h2>
+    <p>Reefy uses accounts. To create one you give us an email address, a
+    password, and a diver name. The account is what your collection belongs to,
+    which is why it survives changing or reinstalling on a new phone — something
+    the previous device-only identity could not do.</p>
+    <p>We do not collect your phone number, real name, date of birth, contacts,
+    or location.</p>
+    <p><strong>Your password</strong> is never stored. What we store is a
+    salted <code>scrypt</code> hash of it, which cannot be reversed back into
+    the password. Nobody at Reefy can read it, and we will never ask you for it.</p>
+    <p><strong>Your email address</strong> is used for exactly two things:
+    sending you a link to confirm the address is yours, and identifying your
+    account when you sign in. We do not send marketing, newsletters, or
+    promotions, and we do not share or sell it. Confirming your address is
+    optional — Reefy works fully without it — but it is what lets you prove the
+    account is yours if you lose access.</p>
+    <p><strong>Staying signed in.</strong> When you sign in, your phone receives
+    a random session token, which it keeps in the iOS Keychain. We store only a
+    hash of that token. Signing out, or deleting your account, destroys it.</p>
+    <p><strong>Sign in with Apple.</strong> If you use it, Apple gives us a
+    unique identifier for your Apple ID and, if you allow it, an email address —
+    which may be one of Apple's private relay addresses. That is all we receive;
+    we never see your Apple ID password.</p>
+    <p>Your device also generates a random identifier (a UUID) sent as the
+    <code>x-device-id</code> header. It grants no access to anything and is used
+    only to rate-limit abuse per install rather than per network address.</p>
 
     <h2>What we store on our server, and why</h2>
     <p>To make the social features work — friends, group dive rooms, trading, and
@@ -121,9 +140,12 @@
     complete list:</p>
     <table>
       <tr><th>What</th><th>Why we store it</th></tr>
-      <tr><td>Random device ID</td><td>To recognise your device and tie your data together. There is no account behind it.</td></tr>
+      <tr><td>Your email address</td><td>To identify your account when you sign in, and to send the one link that confirms the address is yours. Never used for marketing.</td></tr>
+      <tr><td>A hash of your password</td><td>To check your password at sign-in without ever storing the password itself. Not applicable if you sign in with Apple.</td></tr>
+      <tr><td>An Apple account identifier</td><td>Only if you use Sign in with Apple. It identifies your account to us and nothing else.</td></tr>
+      <tr><td>Session tokens (hashed)</td><td>So you stay signed in between launches, and so signing out can revoke access on that device.</td></tr>
       <tr><td>Diver name and its first initial</td><td>So other divers can find you, add you as a friend, trade with you, and see you on the leaderboard.</td></tr>
-      <tr><td>An avatar background colour</td><td>A colour picked automatically from your device ID, used behind the initial of your diver name. Reefy has no profile photos, so this and your initial are the whole of your diver picture.</td></tr>
+      <tr><td>An avatar background colour</td><td>A colour picked automatically when your account is created, used behind the initial of your diver name. Reefy has no profile photos, so this and your initial are the whole of your diver picture.</td></tr>
       <tr><td>Dive activity</td><td>The depth, length in minutes, and timestamps of dives you complete, plus totals (total minutes, number of dives). This powers your stats, the leaderboard, and shared room progress.</td></tr>
       <tr><td>Species you have caught</td><td>Your collection, so it is saved and so trades can be verified as fair.</td></tr>
       <tr><td>Friend links</td><td>Who you have added, so your friends list works.</td></tr>
@@ -170,6 +192,9 @@
     <ul>
       <li><strong>Render</strong> — hosts our application server.</li>
       <li><strong>Neon</strong> — hosts our PostgreSQL database.</li>
+      <li><strong>Resend</strong> — delivers the email that confirms your address.
+      It receives your email address and the contents of that message, and
+      nothing else.</li>
     </ul>
     <p>These providers process data only to host the service for us. If you buy a
     subscription or in-app item in the future, payment is handled by Apple through
@@ -190,10 +215,11 @@
       <em>"Delete my diver &amp; data."</em> This calls our server and permanently
       removes your diver and everything attached to it — your stats, species,
       friend links, room memberships and dives, and trades — in one step.</li>
-      <li><strong>By email:</strong> if you cannot use the in-app button, email us
-      at <a href="mailto:simhwa1001@gmail.com">simhwa1001@gmail.com</a> and we will
-      delete your data. Because we do not collect your email, please include your
-      diver name so we can find the right record.</li>
+      <li><strong>By email:</strong> if you cannot use the in-app button, write to
+      us at <a href="mailto:simhwa1001@gmail.com">simhwa1001@gmail.com</a> from the
+      address on your account and we will delete your data. Deleting your account
+      also signs you out everywhere and destroys every session token attached to
+      it.</li>
     </ul>
     <p>Deletion is permanent and cannot be undone. On-device data (pearls, XP,
     settings) is removed by deleting the app from your phone.</p>
@@ -207,8 +233,12 @@
     <h2>Security</h2>
     <p>Data sent between the app and our server travels over an encrypted (HTTPS)
     connection, and our hosting and database providers protect data in transit and
-    at rest. No system is perfectly secure, but because Reefy collects so little —
-    no email, no password, no real identity — the impact of any issue is limited.</p>
+    at rest. Passwords are stored only as salted <code>scrypt</code> hashes and
+    session tokens only as hashes, so a copy of our database would not hand
+    anyone your password or a working session. Your session token is kept in the
+    iOS Keychain rather than ordinary app storage. No system is perfectly secure,
+    but Reefy still collects very little: no phone number, no real name, no
+    contacts, no location.</p>
 
     <h2>Changes to this policy</h2>
     <p>We may update this policy as the app evolves — for example, when in-app

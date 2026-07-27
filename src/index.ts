@@ -5,8 +5,21 @@ import { randomUUID } from 'node:crypto';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import 'dotenv/config';
-import { query, tx, initSchema, collectionOf, addSpecies, pool } from './db.js';
+import { query, tx, initSchema, collectionOf, addSpecies, pool, pruneExpiredSessions } from './db.js';
 import { isProfaneName } from './moderation.js';
+import {
+  VERIFY_HOURS,
+  bearerToken,
+  hashPassword,
+  hashToken,
+  newSession,
+  newVerification,
+  normaliseEmail,
+  validateEmail,
+  validatePassword,
+  verifyPassword,
+} from './auth.js';
+import { canSendMail, mailConfigured, sendMail, verificationEmail } from './mail.js';
 
 const app = express();
 app.use(cors());
@@ -53,26 +66,63 @@ const strictLimiter = rateLimit({
 });
 
 // ── identity ────────────────────────────────────────────────────────────────
-// No passwords: each install generates a stable device id and sends it as a
-// header. Enough to tell two real testers apart; swap for real auth later.
-type User = { id: string; name: string; initial: string; avatar_bg: string; avatar_url: string | null; last_seen: string };
+// Identity is an account, not an install. It used to be the device id: the
+// client sent `x-device-id` and that string *was* users.id, which meant a
+// reinstall was a new person and there was no way back to your reef. Now the
+// client signs in and sends `Authorization: Bearer <session token>`.
+//
+// The device-id header still exists, but only as a rate-limiting key on the
+// unauthenticated endpoints. It grants nothing.
+type User = {
+  id: string;
+  name: string;
+  initial: string;
+  avatar_bg: string;
+  avatar_url: string | null;
+  email: string | null;
+  email_verified_at: string | null;
+  last_seen: string;
+};
 
 declare global {
   // eslint-disable-next-line @typescript-eslint/no-namespace
   namespace Express {
     interface Request {
       user?: User;
+      sessionTokenHash?: string;
     }
   }
 }
 
+/**
+ * Every column of `users` that is safe to hand to a client. Explicit, not
+ * `SELECT *`: the moment password_hash and apple_sub joined this table, a
+ * wildcard select feeding `res.json({ user })` became a credential leak.
+ */
+const USER_COLS = 'id, name, initial, avatar_bg, avatar_url, email, email_verified_at, last_seen';
+
 async function requireUser(req: Request, res: Response, next: NextFunction) {
-  const id = req.header('x-device-id');
-  if (!id) return res.status(401).json({ error: 'missing x-device-id' });
-  const r = await query<User>('SELECT * FROM users WHERE id = $1', [id]);
-  if (!r.rows[0]) return res.status(404).json({ error: 'unregistered device' });
-  await query('UPDATE users SET last_seen = now() WHERE id = $1', [id]);
+  const token = bearerToken(req.header('authorization'));
+  if (!token) return res.status(401).json({ error: 'Sign in to continue.' });
+
+  const tokenHash = hashToken(token);
+  // One round trip, and the expiry is enforced in the join rather than in JS —
+  // so an expired token is indistinguishable from a forged one from here.
+  const r = await query<User>(
+    `SELECT ${USER_COLS.split(', ').map((c) => `u.${c}`).join(', ')}
+       FROM auth_sessions s
+       JOIN users u ON u.id = s.user_id
+      WHERE s.token_hash = $1 AND s.expires_at > now()`,
+    [tokenHash]
+  );
+  if (!r.rows[0]) return res.status(401).json({ error: 'Your session has expired. Sign in again.' });
+
+  // Best-effort liveness bookkeeping; never blocks the request.
+  void query('UPDATE auth_sessions SET last_used = now() WHERE token_hash = $1', [tokenHash]).catch(() => {});
+  void query('UPDATE users SET last_seen = now() WHERE id = $1', [r.rows[0].id]).catch(() => {});
+
   req.user = r.rows[0];
+  req.sessionTokenHash = tokenHash;
   next();
 }
 
@@ -82,7 +132,12 @@ const asyncRoute =
 
 const AVATARS = ['#9fd9d3', '#FFB5A7', '#FFD700', '#bfdde6', '#4FC3D9', '#4ADE80', '#FF8C69'];
 
-app.get('/api/health', (_req, res) => res.json({ ok: true, service: 'reeffocus-api', time: Date.now() }));
+// `mail` is here so a deploy can be checked without sending anything: it is the
+// one way to confirm RESEND_API_KEY actually reached the running process, which
+// is otherwise only discoverable by a user not receiving their signup email.
+app.get('/api/health', (_req, res) =>
+  res.json({ ok: true, service: 'reeffocus-api', mail: mailConfigured, time: Date.now() })
+);
 
 // ── names ───────────────────────────────────────────────────────────────────
 const NAME_RE = /^[\p{L}\p{N} ._-]{2,20}$/u;
@@ -97,11 +152,11 @@ function validateName(name: string): string | null {
   return null;
 }
 
-/** Is this name free? `deviceId` lets you keep your own name. */
-async function nameTaken(name: string, deviceId?: string) {
+/** Is this name free? `selfId` lets an existing account keep its own name. */
+async function nameTaken(name: string, selfId?: string) {
   const r = await query<{ id: string }>('SELECT id FROM users WHERE LOWER(name) = LOWER($1)', [name]);
   const owner = r.rows[0];
-  return !!owner && owner.id !== deviceId;
+  return !!owner && owner.id !== selfId;
 }
 
 app.get(
@@ -109,50 +164,308 @@ app.get(
   strictLimiter,
   asyncRoute(async (req, res) => {
     const name = String(req.query.name ?? '').trim();
-    const deviceId = req.header('x-device-id') ?? undefined;
+    // Signed-in callers are renaming and may keep their current name; the
+    // signup form has no session yet, so this is optional.
+    const token = bearerToken(req.header('authorization'));
+    let selfId: string | undefined;
+    if (token) {
+      const s = await query<{ user_id: string }>(
+        'SELECT user_id FROM auth_sessions WHERE token_hash = $1 AND expires_at > now()',
+        [hashToken(token)]
+      );
+      selfId = s.rows[0]?.user_id;
+    }
     const problem = validateName(name);
     if (problem) return res.json({ available: false, reason: problem });
-    if (await nameTaken(name, deviceId)) return res.json({ available: false, reason: 'That name is taken.' });
+    if (await nameTaken(name, selfId)) return res.json({ available: false, reason: 'That name is taken.' });
     res.json({ available: true, reason: null });
   })
 );
 
-/** First launch: claim a user row for this device. Idempotent. */
+// ── accounts ────────────────────────────────────────────────────────────────
+
+const avatarFor = (seed: string) =>
+  AVATARS[Math.abs([...seed].reduce((a, c) => a + c.charCodeAt(0), 0)) % AVATARS.length];
+
+/**
+ * A real hash of a value nobody knows, verified against when the email does
+ * not exist. Without it, "no such account" returns in microseconds while a
+ * wrong password takes ~100 ms, and that difference enumerates the user table.
+ */
+const DUMMY_HASH = await hashPassword(randomUUID());
+
+/**
+ * Where the verification link points. An env override for production (so the
+ * link survives the app moving behind a custom domain), falling back to the
+ * host that served the request — which is what makes this work on a laptop and
+ * on a preview deploy without configuration.
+ */
+function publicBase(req: Request): string {
+  return (process.env.PUBLIC_BASE_URL ?? `${req.protocol}://${req.get('host')}`).replace(/\/$/, '');
+}
+
+/**
+ * Issue a fresh verification link and mail it.
+ *
+ * Any outstanding links for the account are dropped first: two live links to
+ * the same address is one more than is useful, and it means "Resend" reliably
+ * invalidates whatever was in the last email rather than leaving a trail of
+ * working credentials in an inbox.
+ */
+async function sendVerification(req: Request, user: { id: string; name: string; email: string }) {
+  const v = newVerification();
+  await tx(async (c) => {
+    await c.query('DELETE FROM email_verifications WHERE user_id = $1', [user.id]);
+    await c.query(
+      'INSERT INTO email_verifications (token_hash, user_id, email, expires_at) VALUES ($1, $2, $3, $4)',
+      [v.tokenHash, user.id, user.email, v.expiresAt]
+    );
+  });
+  const link = `${publicBase(req)}/verify-email?token=${v.token}`;
+  await sendMail({ to: user.email, ...verificationEmail(user.name, link) });
+}
+
+/** What the client gets back on any successful sign-in. */
+async function sessionResponse(res: Response, user: User) {
+  const s = newSession();
+  await query('INSERT INTO auth_sessions (token_hash, user_id, expires_at) VALUES ($1, $2, $3)', [
+    s.tokenHash,
+    user.id,
+    s.expiresAt,
+  ]);
+  res.json({
+    token: s.token,
+    expiresAt: s.expiresAt.toISOString(),
+    user,
+    collection: await collectionOf(user.id),
+  });
+}
+
+/** Create an account. Email + password + the diver name others will see. */
 app.post(
-  '/api/register',
+  '/api/auth/signup',
   strictLimiter,
   asyncRoute(async (req, res) => {
-    const deviceId = String(req.body?.deviceId ?? '').trim();
+    const email = normaliseEmail(String(req.body?.email ?? ''));
+    const password = String(req.body?.password ?? '');
     const name = String(req.body?.name ?? '').trim();
-    if (!deviceId) return res.status(400).json({ error: 'deviceId required' });
 
-    const problem = validateName(name);
-    if (problem) return res.status(400).json({ error: problem });
-    if (await nameTaken(name, deviceId)) return res.status(409).json({ error: 'That name is taken.' });
+    const emailProblem = validateEmail(email);
+    if (emailProblem) return res.status(400).json({ error: emailProblem, field: 'email' });
+    const passwordProblem = validatePassword(password);
+    if (passwordProblem) return res.status(400).json({ error: passwordProblem, field: 'password' });
+    const nameProblem = validateName(name);
+    if (nameProblem) return res.status(400).json({ error: nameProblem, field: 'name' });
 
-    const initial = name[0].toUpperCase();
-    const avatar = AVATARS[Math.abs([...deviceId].reduce((a, c) => a + c.charCodeAt(0), 0)) % AVATARS.length];
+    if (await nameTaken(name)) return res.status(409).json({ error: 'That name is taken.', field: 'name' });
+
+    const id = randomUUID();
+    const passwordHash = await hashPassword(password);
 
     try {
       await tx(async (c) => {
         await c.query(
-          `INSERT INTO users (id, name, initial, avatar_bg) VALUES ($1, $2, $3, $4)
-           ON CONFLICT (id) DO UPDATE SET name = EXCLUDED.name, initial = EXCLUDED.initial, last_seen = now()`,
-          [deviceId, name, initial, avatar]
+          `INSERT INTO users (id, name, initial, avatar_bg, email, password_hash)
+           VALUES ($1, $2, $3, $4, $5, $6)`,
+          [id, name, name[0].toUpperCase(), avatarFor(email), email, passwordHash]
         );
-        await c.query('INSERT INTO user_stats (user_id) VALUES ($1) ON CONFLICT DO NOTHING', [deviceId]);
+        await c.query('INSERT INTO user_stats (user_id) VALUES ($1)', [id]);
       });
     } catch (e: any) {
-      // Two devices can race past the pre-check; the unique index is the real
-      // arbiter, so translate its violation into the same friendly conflict.
-      if (e?.code === '23505') return res.status(409).json({ error: 'That name is taken.' });
+      // Two signups can race past the pre-checks; the unique indexes are the
+      // real arbiters, so translate a violation into the same friendly error.
+      if (e?.code === '23505') {
+        const onEmail = String(e?.constraint ?? '').includes('email');
+        return res.status(409).json({
+          error: onEmail ? 'There is already an account with that email.' : 'That name is taken.',
+          field: onEmail ? 'email' : 'name',
+        });
+      }
       throw e;
     }
 
-    const u = await query<User>('SELECT * FROM users WHERE id = $1', [deviceId]);
-    res.json({ user: u.rows[0], collection: await collectionOf(deviceId) });
+    const u = await query<User>(`SELECT ${USER_COLS} FROM users WHERE id = $1`, [id]);
+
+    // Deliberately not awaited into the response. Verification is a nudge, not
+    // a gate — the account is usable this second — so a slow or failing mail
+    // provider must not turn a successful signup into an error the user reads
+    // as "it didn't work". They land in the app; the banner offers Resend.
+    void sendVerification(req, { id, name, email }).catch((e) =>
+      console.error('[reeffocus-api] verification send failed:', e.message)
+    );
+
+    await sessionResponse(res, u.rows[0]);
   })
 );
+
+/** Sign in to an existing account. */
+app.post(
+  '/api/auth/login',
+  strictLimiter,
+  asyncRoute(async (req, res) => {
+    const email = normaliseEmail(String(req.body?.email ?? ''));
+    const password = String(req.body?.password ?? '');
+
+    const r = await query<User & { password_hash: string | null }>(
+      `SELECT ${USER_COLS}, password_hash FROM users WHERE LOWER(email) = $1`,
+      [email]
+    );
+    const row = r.rows[0];
+
+    // One message for "no such email" and "wrong password", and the hash is
+    // verified even when there is no user, so response time does not leak
+    // which addresses have accounts.
+    const ok = await verifyPassword(password, row?.password_hash ?? DUMMY_HASH);
+    if (!row || !ok) return res.status(401).json({ error: 'That email and password don’t match.' });
+
+    // Drop the hash before this object can reach a response body.
+    const { password_hash: _omit, ...user } = row;
+
+    void pruneExpiredSessions().catch(() => {});
+    await sessionResponse(res, user);
+  })
+);
+
+/** Sign out this device. Other devices keep their sessions. */
+app.post(
+  '/api/auth/logout',
+  requireUser,
+  asyncRoute(async (req, res) => {
+    await query('DELETE FROM auth_sessions WHERE token_hash = $1', [req.sessionTokenHash]);
+    res.json({ ok: true });
+  })
+);
+
+/**
+ * Which ways in actually work right now.
+ *
+ * This exists so the sign-in screen can render only buttons that do something.
+ * A "Continue with Apple" button that shows the system sheet and then fails is
+ * Guideline 2.1 — the same shape of problem as the purchase kill-switches that
+ * had to come out — and the honest fix is for the server to say what it
+ * supports rather than for the app to guess.
+ *
+ * Unauthenticated and cheap on purpose: it is fetched before anyone is signed
+ * in, and the client defaults to hiding a method rather than showing one, so a
+ * failed probe is safe.
+ */
+/**
+ * Sign in with Apple. Off until the Apple Developer Program enrolment (B1)
+ * exists: the capability is enabled on the App ID in the developer portal, and
+ * verifying the identity token server-side needs a Services ID and a key that
+ * only a paid account can create.
+ *
+ * Flipping this to true is not enough on its own — the route below has to be
+ * implemented first. It is a named constant so the two can't drift apart
+ * silently, and so `/api/auth/methods` never advertises something that 501s.
+ */
+const APPLE_SIGN_IN_READY = false;
+
+app.get('/api/auth/methods', (_req, res) =>
+  res.json({ email: true, apple: APPLE_SIGN_IN_READY })
+);
+
+app.post('/api/auth/apple', strictLimiter, (_req, res) =>
+  res.status(501).json({ error: 'Sign in with Apple isn’t available yet.', unavailable: true })
+);
+
+// ── email verification ──────────────────────────────────────────────────────
+// Soft by design: an unverified account is a whole account. This exists so a
+// diver who loses their phone can prove the address is theirs, not to hold the
+// app hostage while an email crosses the internet.
+
+/** Send another verification link to the address already on the account. */
+app.post(
+  '/api/auth/verify/resend',
+  strictLimiter,
+  requireUser,
+  asyncRoute(async (req, res) => {
+    const user = req.user!;
+    if (!user.email) return res.status(400).json({ error: 'This account has no email address.' });
+    if (user.email_verified_at) return res.json({ sent: false, alreadyVerified: true });
+    if (!canSendMail) {
+      // Say so rather than reporting a send that will never happen. The app
+      // shows this verbatim, so it has to be true.
+      return res.status(503).json({ error: 'We can’t send email right now. Try again later.' });
+    }
+    // Here the send *is* the action, so unlike signup a failure is the answer.
+    await sendVerification(req, { id: user.id, name: user.name, email: user.email });
+    res.json({ sent: true, alreadyVerified: false });
+  })
+);
+
+/**
+ * Redeem a link. This is opened in a mail client's browser, not in the app, so
+ * it answers with a page rather than JSON and never requires a session — the
+ * token in the URL is the whole credential.
+ *
+ * The app learns the result on its next sync rather than through a deep link:
+ * one code path, and it works whether the link was opened on this phone, a
+ * laptop, or a tablet.
+ */
+app.get(
+  '/verify-email',
+  asyncRoute(async (req, res) => {
+    const token = String(req.query.token ?? '');
+    const r = token
+      ? await query<{ user_id: string; email: string }>(
+          `DELETE FROM email_verifications
+            WHERE token_hash = $1 AND expires_at > now()
+        RETURNING user_id, email`,
+          [hashToken(token)]
+        )
+      : { rows: [] as { user_id: string; email: string }[] };
+
+    const row = r.rows[0];
+    if (!row) {
+      return res
+        .status(400)
+        .type('html')
+        .send(
+          verifyPage(
+            'This link has expired',
+            `Verification links last ${VERIFY_HOURS} hours. Open Reefy and tap “Resend” to get a fresh one.`
+          )
+        );
+    }
+
+    // Only mark verified if the address still matches the one the link was
+    // mailed to. Changing your email must not be confirmable by a link sent to
+    // the previous address.
+    const u = await query<{ name: string }>(
+      `UPDATE users SET email_verified_at = now()
+        WHERE id = $1 AND LOWER(email) = LOWER($2)
+    RETURNING name`,
+      [row.user_id, row.email]
+    );
+    if (!u.rows[0]) {
+      return res
+        .status(400)
+        .type('html')
+        .send(verifyPage('That address has changed', 'Open Reefy and tap “Resend” to confirm your current email.'));
+    }
+
+    res.type('html').send(verifyPage('Email confirmed', 'You can close this and go back to Reefy. Happy diving.'));
+  })
+);
+
+/** A whole page in one function. It is two lines of text; a template file would be more moving parts than markup. */
+function verifyPage(title: string, body: string): string {
+  const esc = (s: string) => s.replace(/[&<>]/g, (c) => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;' })[c]!);
+  return `<!doctype html>
+<html lang="en"><head>
+<meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
+<title>${esc(title)} · Reefy</title>
+<style>
+  body { margin:0; min-height:100vh; display:grid; place-items:center; padding:24px;
+         background:#0A2540; color:#F0F7FA;
+         font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',Helvetica,Arial,sans-serif; }
+  main { max-width:26rem; text-align:center; }
+  h1 { font-size:1.6rem; margin:0 0 .6rem; }
+  p { color:#9DB4C0; line-height:1.5; margin:0; }
+</style>
+</head><body><main><h1>${esc(title)}</h1><p>${esc(body)}</p></main></body></html>`;
+}
 
 app.get(
   '/api/me',
@@ -160,6 +473,42 @@ app.get(
   asyncRoute(async (req, res) => {
     const stats = await query('SELECT * FROM user_stats WHERE user_id = $1', [req.user!.id]);
     res.json({ user: req.user, collection: await collectionOf(req.user!.id), stats: stats.rows[0] ?? null });
+  })
+);
+
+/**
+ * Change the diver name others see.
+ *
+ * This route is new, and it is new because it had to be. The name used to be
+ * persisted as a side effect of `POST /api/register`, which the client called
+ * on every sync — so "renaming" was really "re-registering". Accounts removed
+ * that call, and without this the Edit button on the profile screen would have
+ * gone on working locally while the leaderboard kept showing the old name.
+ */
+app.patch(
+  '/api/me/name',
+  strictLimiter,
+  requireUser,
+  asyncRoute(async (req, res) => {
+    const name = String(req.body?.name ?? '').trim();
+    const problem = validateName(name);
+    if (problem) return res.status(400).json({ error: problem, field: 'name' });
+    if (await nameTaken(name, req.user!.id)) {
+      return res.status(409).json({ error: 'That name is taken.', field: 'name' });
+    }
+    try {
+      await query('UPDATE users SET name = $1, initial = $2 WHERE id = $3', [
+        name,
+        name[0].toUpperCase(),
+        req.user!.id,
+      ]);
+    } catch (e: any) {
+      // The unique index is the real arbiter when two renames race.
+      if (e?.code === '23505') return res.status(409).json({ error: 'That name is taken.', field: 'name' });
+      throw e;
+    }
+    const u = await query<User>(`SELECT ${USER_COLS} FROM users WHERE id = $1`, [req.user!.id]);
+    res.json({ user: u.rows[0] });
   })
 );
 

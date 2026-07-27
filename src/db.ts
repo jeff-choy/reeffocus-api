@@ -241,7 +241,80 @@ export async function initSchema() {
     ALTER TABLE users ADD COLUMN IF NOT EXISTS avatar_url TEXT;
     ALTER TABLE user_stats ADD COLUMN IF NOT EXISTS week_mins INTEGER NOT NULL DEFAULT 0;
     ALTER TABLE user_stats ADD COLUMN IF NOT EXISTS week_start DATE;
+
+    -- ── accounts ──────────────────────────────────────────────────────────
+    -- Identity used to be the device id: users.id *was* the install's id, so a
+    -- reinstall was a new person and a reef could not survive one. It is now an
+    -- opaque uuid with credentials hanging off it, and the device is just a
+    -- client holding a session token.
+    --
+    -- All three columns are nullable because not every account has every one:
+    -- an email signup has no apple_sub, an Apple signup has no password_hash
+    -- (and may have no email, if the user hid it).
+    ALTER TABLE users ADD COLUMN IF NOT EXISTS email         TEXT;
+    ALTER TABLE users ADD COLUMN IF NOT EXISTS password_hash TEXT;
+    ALTER TABLE users ADD COLUMN IF NOT EXISTS apple_sub     TEXT;
+
+    -- Case-insensitive uniqueness on the stored-lowercase column: the app
+    -- normalises before writing, and this is the backstop that makes a race
+    -- between two signups resolve to one account rather than two.
+    CREATE UNIQUE INDEX IF NOT EXISTS users_email_key ON users (LOWER(email)) WHERE email IS NOT NULL;
+    CREATE UNIQUE INDEX IF NOT EXISTS users_apple_sub_key ON users (apple_sub) WHERE apple_sub IS NOT NULL;
+
+    -- Opaque session tokens, stored only as a SHA-256 hash. ON DELETE CASCADE
+    -- is what makes "delete my account" also mean "log out everywhere", and it
+    -- is why account deletion needs no extra step here.
+    CREATE TABLE IF NOT EXISTS auth_sessions (
+      token_hash TEXT PRIMARY KEY,
+      user_id    TEXT NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+      created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+      last_used  TIMESTAMPTZ NOT NULL DEFAULT now(),
+      expires_at TIMESTAMPTZ NOT NULL
+    );
+    CREATE INDEX IF NOT EXISTS auth_sessions_user ON auth_sessions(user_id);
+
+    -- Null until the address is confirmed. A timestamp rather than a boolean
+    -- because "when" answers questions "whether" can't — chiefly whether a
+    -- verification predates an email change.
+    ALTER TABLE users ADD COLUMN IF NOT EXISTS email_verified_at TIMESTAMPTZ;
+
+    -- One row per outstanding verification link. The email is stored alongside
+    -- the token rather than read from users at redemption time: it pins the
+    -- link to the address it was sent to, so a link mailed to an old address
+    -- cannot confirm a new one.
+    CREATE TABLE IF NOT EXISTS email_verifications (
+      token_hash TEXT PRIMARY KEY,
+      user_id    TEXT NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+      email      TEXT NOT NULL,
+      created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+      expires_at TIMESTAMPTZ NOT NULL
+    );
+    CREATE INDEX IF NOT EXISTS email_verifications_user ON email_verifications(user_id);
+
+    -- ── retire the device-id divers ───────────────────────────────────────
+    -- Before accounts, users.id *was* the install's device id and there were no
+    -- credentials at all. Those rows cannot be signed into by anyone, ever, and
+    -- each one holds a unique diver name hostage — so a beta tester's abandoned
+    -- "Jeff" would permanently block the real signup.
+    --
+    -- Safe to run on every boot, not just once: every account created since has
+    -- at least one of these three set in the same INSERT that creates the row,
+    -- so there is no window in which a live account looks like a legacy one.
+    -- Everything else about a user cascades from here.
+    DELETE FROM users
+     WHERE password_hash IS NULL AND apple_sub IS NULL AND email IS NULL;
   `);
+}
+
+/**
+ * Drop sessions that have aged out. Called opportunistically on login rather
+ * than on a schedule: expired tokens are already rejected on use, so this is
+ * housekeeping, not enforcement, and a cron for it would be a moving part
+ * bought with nothing.
+ */
+export async function pruneExpiredSessions() {
+  await query('DELETE FROM auth_sessions WHERE expires_at < now()');
+  await query('DELETE FROM email_verifications WHERE expires_at < now()');
 }
 
 export async function addSpecies(client: pg.PoolClient, userId: string, speciesId: string, delta: number) {
