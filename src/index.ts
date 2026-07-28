@@ -19,7 +19,7 @@ import {
   validatePassword,
   verifyPassword,
 } from './auth.js';
-import { canSendMail, mailConfigured, sendMail, verificationEmail } from './mail.js';
+import { canSendMail, mailConfigured, mailFrom, sendMail, verificationEmail } from './mail.js';
 import { verifyAppleIdentityToken } from './appleToken.js';
 import { effectOf, type RcEvent } from './revenuecat.js';
 
@@ -149,6 +149,20 @@ app.get('/api/health', (_req, res) =>
     ok: true,
     service: 'reefie-api',
     mail: mailConfigured,
+    // Same purpose as `mail`, for the same reason: the only other way to tell
+    // whether REVENUECAT_WEBHOOK_SECRET reached this process is to POST to the
+    // webhook and read 503-vs-401 off the failure, which means probing a route
+    // that grants paid entitlements to answer a configuration question. A
+    // boolean here says whether the variable arrived without revealing it, and
+    // without saying it is *correct* — that is what a real delivery proves.
+    revenuecatWebhook: RC_WEBHOOK_SECRET.length > 0,
+    // The address confirmation mail is actually sent from. Echoed in full
+    // rather than reduced to a boolean, because the failure this catches is not
+    // "unset" — an unset MAIL_FROM falls back to Resend's shared sender, which
+    // delivers only to the Resend account owner. That looks like working mail
+    // from the one inbox anyone would test from. Publishing the value is safe:
+    // it is printed in the privacy policy and on every message we send.
+    mailFrom: mailFrom(),
     baseUrl: process.env.PUBLIC_BASE_URL ?? null,
     time: Date.now(),
   })

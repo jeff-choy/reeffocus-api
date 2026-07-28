@@ -82,7 +82,7 @@
   <div class="wrap">
     <span class="brand"><span class="dot"></span> Reefie</span>
     <h1>Privacy Policy</h1>
-    <p class="dated">Effective date: 27 July 2026</p>
+    <p class="dated">Effective date: 28 July 2026</p>
   </div>
 </header>
 <main>
@@ -152,6 +152,8 @@
       <tr><td>Room and expedition membership and dives</td><td>Which group dives you are in and your contributions to their shared progress.</td></tr>
       <tr><td>Trades</td><td>Offers you send or receive, and their outcome.</td></tr>
       <tr><td>Reports you file</td><td>If you report another diver, we store who reported whom and an optional short reason, so a human can review it for moderation.</td></tr>
+      <tr><td>Divers you have blocked</td><td>So the block keeps working. Blocking is symmetric and applies everywhere — neither of you appears to the other in the diver list, the leaderboard, trades or rooms. You can undo it in Settings.</td></tr>
+      <tr><td>What you have purchased</td><td>Whether Reefie Pro is active and when it runs out, whether you bought the one-time Lifetime unlock, and a record of each pearl purchase. We store this so that what you paid for follows your account to a new phone, and so that each purchase is credited exactly once. We never see or store your card details — only Apple does.</td></tr>
       <tr><td>Last-seen time</td><td>Updated when your device talks to the server, so friends can see who is active.</td></tr>
     </table>
     <p class="note">Our server runs on Render and the database is hosted on Neon
@@ -185,6 +187,20 @@
     <p>As of the effective date, Reefie contains no third-party analytics, no
     advertising, and no tracking SDKs. We do not track you across other companies'
     apps or websites, and we do not sell or rent your data to anyone.</p>
+    <p>Reefie does report crashes, which is a different thing and is described
+    below. A crash report tells us that something broke and where in our code it
+    broke. It is not used to build a profile of you, and it is not shared with
+    anyone for their own purposes.</p>
+
+    <h2>Crash reports</h2>
+    <p>When the app hits an unexpected error, it sends a report to Sentry, our
+    crash-reporting provider. That report contains the error, the stack trace
+    around it, a short trail of the in-app actions that led up to it, and basic
+    device information such as the model and iOS version.</p>
+    <p>It does <strong>not</strong> contain your name, your email address, your
+    account identifier or your IP address. We configure Sentry with personal
+    information switched off, which is what keeps a crash report unattributable
+    to you rather than merely unlabelled.</p>
 
     <h2>Where your data lives (service providers)</h2>
     <p>We do not share your data with third parties for their own use. We do rely
@@ -195,10 +211,17 @@
       <li><strong>Resend</strong> — delivers the email that confirms your address.
       It receives your email address and the contents of that message, and
       nothing else.</li>
+      <li><strong>Sentry</strong> — receives the crash reports described above.
+      Our Sentry project is hosted in the European Union.</li>
+      <li><strong>RevenueCat</strong> — checks with Apple that a purchase is
+      genuine, and tells our server what you are entitled to. It receives your
+      Reefie account identifier and the purchase details, so that a subscription
+      you paid for follows your account to a new phone. It never receives your
+      payment details, which only Apple sees.</li>
     </ul>
-    <p>These providers process data only to host the service for us. If you buy a
-    subscription or in-app item in the future, payment is handled by Apple through
-    the App Store; see the Terms of Service and Apple's own privacy policy.</p>
+    <p>These providers process data only to run the service for us. Payment
+    itself is handled by Apple through the App Store — we never see or store your
+    card details. See the Terms of Service and Apple's own privacy policy.</p>
 
     <h2>Retention</h2>
     <p>We keep your server-side data for as long as your diver exists — that is,

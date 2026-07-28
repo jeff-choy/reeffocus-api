@@ -12,6 +12,40 @@ services:
     envVars:
       - key: NODE_VERSION
         value: 22
-      # Paste your Neon connection string in the Render dashboard (do not commit it)
+      # `sync: false` means "this service needs the variable, but the value is
+      # set in the dashboard and never committed". Declaring them here is not
+      # decoration: it is the only place that records what the service requires.
+      # Three of these were set in the dashboard and never written down, so the
+      # blueprint claimed the API needed one secret when it actually needs four.
+      #
+      # Paste your Neon connection string in the Render dashboard.
       - key: DATABASE_URL
+        sync: false
+      # Resend. Without it the server refuses to send in production rather than
+      # pretending to, so account recovery would silently not exist.
+      # Verify with: curl -s https://api.reefie.io/api/health  -> "mail": true
+      - key: RESEND_API_KEY
+        sync: false
+      # The origin used to build email confirmation links. Must be the public
+      # host, or every confirmation link points somewhere that does not serve.
+      - key: PUBLIC_BASE_URL
+        sync: false
+      # The sending address, e.g. "Reefie <support@reefie.io>". If this is unset
+      # the code falls back to Resend's shared onboarding@resend.dev, which
+      # delivers ONLY to the address the Resend account was registered with — so
+      # confirmation mail reaches you and nobody else. That fallback is a
+      # deliberate choice (see the comment in src/mail.ts: fail visibly to the
+      # owner rather than invisibly to everyone), which is exactly why the real
+      # value has to be set here.
+      # Verify with: curl -s https://api.reefie.io/api/health -> "mailFrom"
+      - key: MAIL_FROM
+        sync: false
+      # Shared secret for the RevenueCat webhook. Must match the Authorization
+      # header value configured in RevenueCat -> Integrations -> Webhooks
+      # *byte for byte* — the route compares the whole raw header in constant
+      # time and does not strip a "Bearer " prefix.
+      # Verify with: curl -s https://api.reefie.io/api/health
+      #   -> "revenuecatWebhook": true   (the variable arrived)
+      # Until it is set the webhook answers 503 and grants nothing.
+      - key: REVENUECAT_WEBHOOK_SECRET
         sync: false

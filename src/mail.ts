@@ -45,6 +45,15 @@ const FROM = process.env.MAIL_FROM ?? 'Reefie <onboarding@resend.dev>';
 export const mailConfigured = !!API_KEY;
 
 /**
+ * The address mail is actually sent from, for /api/health to echo.
+ *
+ * A function rather than the `FROM` constant re-exported, so the health route
+ * cannot be read as permission to send from somewhere else — this is a report
+ * of configuration, not a second source of it.
+ */
+export const mailFrom = (): string => FROM;
+
+/**
  * Whether `sendMail` can be expected to succeed. Routes read *this*, not
  * `mailConfigured`, so the guard matches what sendMail actually does: with no
  * key it logs the message in development and throws in production. Checking
