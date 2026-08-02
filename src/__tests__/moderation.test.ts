@@ -31,6 +31,63 @@ describe('isProfaneName — rejects', () => {
   for (const [name, why] of evasions) {
     test(`evasion (${why}): ${name}`, () => assert.equal(isProfaneName(name), true));
   }
+
+  // Stretched letters used to walk straight through the substring list.
+  const stretched = ['fuuuck', 'shiiiit', 'niiigger', 'biiitch'] as const;
+  for (const name of stretched) {
+    test(`stretched letters: ${name}`, () => assert.equal(isProfaneName(name), true));
+  }
+});
+
+// The group the filter was missing: offensive by reference, with no swear word
+// in it at all. Every one of these was an allowed diver name before.
+describe('isProfaneName — hate and extremism', () => {
+  const bad = [
+    'Adolf',
+    'adolf hitler',
+    'Hitler',
+    'BigNazi',
+    'sieg heil',
+    'white power',
+    'the third reich',
+    '1488',
+    'KKK',
+    'Stalin',
+    'Bin Laden',
+  ];
+  for (const name of bad) {
+    test(`rejects: ${name}`, () => assert.equal(isProfaneName(name), true));
+  }
+
+  // 'adolf' is deliberately exact-tier so real names survive it.
+  const innocent = [
+    ['Adolfo', 'a name people actually have'],
+    ['Rudolf', 'ditto'],
+    ['Randolph', 'ditto'],
+    ['Stalingrad', 'a place, not the man'],
+    ['Lynch', 'a common surname'],
+  ] as const;
+  for (const [name, why] of innocent) {
+    test(`allows ${name} (${why})`, () => assert.equal(isProfaneName(name), false));
+  }
+});
+
+describe('isProfaneName — sexual content and self-harm', () => {
+  const bad = ['pornstar', 'BigDildo', 'gangbang', 'kys', 'rape', 'a rapist', 'nsfw'];
+  for (const name of bad) {
+    test(`rejects: ${name}`, () => assert.equal(isProfaneName(name), true));
+  }
+
+  const innocent = [
+    ['Analysis', 'contains "anal"'],
+    ['Canal Diver', 'contains "anal"'],
+    ['Grape', 'contains "rape"'],
+    ['Sussex', 'contains "sex"'],
+    ['Therapist', 'contains "rapist"'],
+  ] as const;
+  for (const [name, why] of innocent) {
+    test(`allows ${name} (${why})`, () => assert.equal(isProfaneName(name), false));
+  }
 });
 
 describe('isProfaneName — allows', () => {

@@ -1,4 +1,5 @@
 import pg from 'pg';
+import { randomUUID } from 'node:crypto';
 
 const { Pool } = pg;
 
@@ -56,12 +57,30 @@ export async function initSchema() {
       last_seen   TIMESTAMPTZ NOT NULL DEFAULT now()
     );
 
+    -- Superseded by user_creatures, which is now authoritative. Kept only so
+    -- the backfill below has something to read on a database that predates the
+    -- change; nothing writes to it any more.
     CREATE TABLE IF NOT EXISTS user_species (
       user_id    TEXT NOT NULL REFERENCES users(id) ON DELETE CASCADE,
       species_id TEXT NOT NULL,
       count      INTEGER NOT NULL DEFAULT 0 CHECK (count >= 0),
       PRIMARY KEY (user_id, species_id)
     );
+
+    -- One row per creature actually caught, so a diver holding three clownfish
+    -- holds three distinguishable fish that can each carry a nickname and be
+    -- traded away individually. Counts are derived from here by GROUP BY;
+    -- storing them separately would give two sources of truth that drift.
+    CREATE TABLE IF NOT EXISTS user_creatures (
+      id         TEXT PRIMARY KEY,
+      user_id    TEXT NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+      species_id TEXT NOT NULL,
+      nickname   TEXT,
+      caught_at  TIMESTAMPTZ NOT NULL DEFAULT now()
+    );
+
+    CREATE INDEX IF NOT EXISTS user_creatures_user ON user_creatures(user_id);
+    CREATE INDEX IF NOT EXISTS user_creatures_user_species ON user_creatures(user_id, species_id);
 
     CREATE TABLE IF NOT EXISTS user_stats (
       user_id    TEXT PRIMARY KEY REFERENCES users(id) ON DELETE CASCADE,
@@ -177,6 +196,10 @@ export async function initSchema() {
       created_at  TIMESTAMPTZ NOT NULL DEFAULT now(),
       resolved_at TIMESTAMPTZ
     );
+
+    -- Which specific fish is being offered. Null on trades proposed before
+    -- creatures were individuals; the accept path falls back to picking one.
+    ALTER TABLE trades ADD COLUMN IF NOT EXISTS give_creature_id TEXT;
 
     CREATE INDEX IF NOT EXISTS trades_to_status ON trades(to_id, status);
     CREATE INDEX IF NOT EXISTS trades_from_status ON trades(from_id, status);
@@ -329,6 +352,23 @@ export async function initSchema() {
     -- Everything else about a user cascades from here.
     DELETE FROM users
      WHERE password_hash IS NULL AND apple_sub IS NULL AND email IS NULL;
+
+    -- ── backfill counts into individual creatures ─────────────────────────
+    -- A diver who held 3 clownfish under the old counts model ends up with 3
+    -- unnamed clownfish rows, which is exactly what they had — just addressable
+    -- now. generate_series turns the count into that many rows.
+    --
+    -- Guarded per user rather than by a migration flag: a diver who already has
+    -- any creature row has been migrated (or caught something since), and
+    -- re-running would double their collection. That makes this safe on every
+    -- boot, which is the property the rest of initSchema relies on too.
+    INSERT INTO user_creatures (id, user_id, species_id, caught_at)
+    SELECT 'c' || substr(gen_random_uuid()::text, 1, 8) || substr(md5(random()::text), 1, 4),
+           us.user_id, us.species_id, now()
+      FROM user_species us
+      CROSS JOIN LATERAL generate_series(1, us.count)
+     WHERE us.count > 0
+       AND NOT EXISTS (SELECT 1 FROM user_creatures uc WHERE uc.user_id = us.user_id);
   `);
 }
 
@@ -343,35 +383,103 @@ export async function pruneExpiredSessions() {
   await query('DELETE FROM email_verifications WHERE expires_at < now()');
 }
 
-export async function addSpecies(client: pg.PoolClient, userId: string, speciesId: string, delta: number) {
-  if (delta < 0) {
-    // Must be a plain UPDATE, not an upsert: Postgres checks CHECK (count >= 0)
-    // against the *proposed* INSERT row before ON CONFLICT can resolve, so an
-    // upsert of -1 fails the constraint even when the row already exists.
-    // The CHECK still protects us here — it rejects any update that would go
-    // below zero, which is exactly the guard we want on a trade.
-    const r = await client.query(
-      `UPDATE user_species SET count = count + $3
-        WHERE user_id = $1 AND species_id = $2
-        RETURNING count`,
-      [userId, speciesId, delta]
-    );
-    if (!r.rows[0]) throw Object.assign(new Error('species not held'), { status: 409 });
-    return;
-  }
-  await client.query(
-    `INSERT INTO user_species (user_id, species_id, count)
-     VALUES ($1, $2, $3)
-     ON CONFLICT (user_id, species_id)
-     DO UPDATE SET count = user_species.count + $3`,
-    [userId, speciesId, delta]
+/** One caught creature, as the app sees it. */
+export type Creature = { id: string; speciesId: string; nickname: string | null; caughtAt: string };
+
+const shapeCreature = (r: { id: string; species_id: string; nickname: string | null; caught_at: Date | string }): Creature => ({
+  id: r.id,
+  speciesId: r.species_id,
+  nickname: r.nickname,
+  caughtAt: r.caught_at instanceof Date ? r.caught_at.toISOString() : String(r.caught_at),
+});
+
+const newCreatureId = () => 'c' + randomUUID().slice(0, 12);
+
+/** Every creature a diver holds, oldest first so the collection reads as a log. */
+export async function creaturesOf(userId: string): Promise<Creature[]> {
+  const r = await query<any>(
+    `SELECT id, species_id, nickname, caught_at
+       FROM user_creatures WHERE user_id = $1
+      ORDER BY caught_at ASC, id ASC`,
+    [userId]
   );
+  return r.rows.map(shapeCreature);
 }
 
+/**
+ * Species counts, derived rather than stored.
+ *
+ * Still the shape the leaderboard, trade screen and Ocean Book work in — "do I
+ * hold a spare of this species" is a question about counts — but there is only
+ * one place the answer comes from now, so it cannot disagree with the creatures
+ * themselves.
+ */
 export async function collectionOf(userId: string): Promise<Record<string, number>> {
-  const r = await query<{ species_id: string; count: number }>(
-    'SELECT species_id, count FROM user_species WHERE user_id = $1 AND count > 0',
+  const r = await query<{ species_id: string; count: string }>(
+    'SELECT species_id, COUNT(*)::int AS count FROM user_creatures WHERE user_id = $1 GROUP BY species_id',
     [userId]
   );
   return Object.fromEntries(r.rows.map((x) => [x.species_id, Number(x.count)]));
+}
+
+/** Land a new creature. The nickname is optional — an unnamed fish is fine. */
+export async function addCreature(
+  client: pg.PoolClient,
+  userId: string,
+  speciesId: string,
+  nickname: string | null = null
+): Promise<Creature> {
+  const r = await client.query(
+    `INSERT INTO user_creatures (id, user_id, species_id, nickname)
+     VALUES ($1, $2, $3, $4)
+     RETURNING id, species_id, nickname, caught_at`,
+    [newCreatureId(), userId, speciesId, nickname]
+  );
+  return shapeCreature(r.rows[0]);
+}
+
+/**
+ * Hand a specific creature to another diver, nickname and all.
+ *
+ * Guarded on the current owner in the same statement that moves it, so two
+ * trades racing for the same fish cannot both succeed — the second updates zero
+ * rows and is rejected rather than duplicating it.
+ */
+export async function moveCreature(client: pg.PoolClient, creatureId: string, fromUserId: string, toUserId: string) {
+  const r = await client.query(
+    'UPDATE user_creatures SET user_id = $3 WHERE id = $1 AND user_id = $2 RETURNING id',
+    [creatureId, fromUserId, toUserId]
+  );
+  if (!r.rows[0]) throw Object.assign(new Error('that creature is no longer available'), { status: 409 });
+}
+
+/**
+ * Pick which fish to hand over when only a species was agreed.
+ *
+ * The oldest is chosen deliberately: a diver who has named a favourite is far
+ * more likely to have named the one they have had longest, so giving away the
+ * most recent duplicate is the kinder default. Only ever called where a spare
+ * is required, and the caller re-checks the count inside the transaction.
+ */
+export async function oldestSpare(client: pg.PoolClient, userId: string, speciesId: string): Promise<string> {
+  const r = await client.query<{ id: string }>(
+    `SELECT id FROM user_creatures
+      WHERE user_id = $1 AND species_id = $2
+      ORDER BY caught_at DESC, id DESC
+      LIMIT 1`,
+    [userId, speciesId]
+  );
+  if (!r.rows[0]) throw Object.assign(new Error('species not held'), { status: 409 });
+  return r.rows[0].id;
+}
+
+/** Rename one of your own creatures. Returns null if it isn't yours. */
+export async function renameCreature(userId: string, creatureId: string, nickname: string | null): Promise<Creature | null> {
+  const r = await query<any>(
+    `UPDATE user_creatures SET nickname = $3
+      WHERE id = $1 AND user_id = $2
+      RETURNING id, species_id, nickname, caught_at`,
+    [creatureId, userId, nickname]
+  );
+  return r.rows[0] ? shapeCreature(r.rows[0]) : null;
 }

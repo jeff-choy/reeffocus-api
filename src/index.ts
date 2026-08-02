@@ -5,7 +5,10 @@ import { randomUUID, timingSafeEqual } from 'node:crypto';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import 'dotenv/config';
-import { query, tx, initSchema, collectionOf, addSpecies, pool, pruneExpiredSessions } from './db.js';
+import {
+  query, tx, initSchema, collectionOf, creaturesOf, addCreature, moveCreature, oldestSpare,
+  renameCreature, pool, pruneExpiredSessions, type Creature,
+} from './db.js';
 import { isProfaneName } from './moderation.js';
 import {
   VERIFY_HOURS,
@@ -181,6 +184,24 @@ function validateName(name: string): string | null {
   return null;
 }
 
+/**
+ * Creature nicknames.
+ *
+ * Shorter than a diver name, and a single character is fine — "X" is a
+ * perfectly good name for a fish. But a nickname travels to another diver when
+ * the fish is traded, which makes it exactly as public as a diver name, so it
+ * goes through the same content filter with no exceptions.
+ */
+const NICKNAME_RE = /^[\p{L}\p{N} ._-]{1,16}$/u;
+
+function validateNickname(name: string): string | null {
+  if (name.length < 1) return 'Give it a name, or skip.';
+  if (name.length > 16) return 'Names are 16 characters or fewer.';
+  if (!NICKNAME_RE.test(name)) return 'Use letters, numbers, spaces, . _ or - only.';
+  if (isProfaneName(name)) return 'Pick a different name.';
+  return null;
+}
+
 /** Is this name free? `selfId` lets an existing account keep its own name. */
 async function nameTaken(name: string, selfId?: string) {
   const r = await query<{ id: string }>('SELECT id FROM users WHERE LOWER(name) = LOWER($1)', [name]);
@@ -267,6 +288,7 @@ async function sessionResponse(res: Response, user: User) {
     expiresAt: s.expiresAt.toISOString(),
     user,
     collection: await collectionOf(user.id),
+    creatures: await creaturesOf(user.id),
   });
 }
 
@@ -660,6 +682,7 @@ app.get(
     res.json({
       user: req.user,
       collection: await collectionOf(req.user!.id),
+      creatures: await creaturesOf(req.user!.id),
       stats: stats.rows[0] ?? null,
       entitlements: await entitlementsOf(req.user!.id),
     });
@@ -921,8 +944,22 @@ app.post(
     const mins = Math.max(0, Math.min(120, Number(req.body?.mins) || 0));
     const me = req.user!.id;
 
+    // Naming happens at the reveal, so the nickname arrives with the catch. It
+    // is optional in both directions: a fish can be landed unnamed and named
+    // later, and a rejected nickname must not cost the diver the catch — so a
+    // bad one is dropped and reported rather than failing the whole request.
+    const rawNickname = req.body?.nickname == null ? null : String(req.body.nickname).trim();
+    let nickname: string | null = null;
+    let nicknameRejected: string | null = null;
+    if (rawNickname) {
+      const problem = validateNickname(rawNickname);
+      if (problem) nicknameRejected = problem;
+      else nickname = rawNickname;
+    }
+
+    let creature: Creature | null = null;
     await tx(async (c) => {
-      if (speciesId) await addSpecies(c, me, speciesId, 1);
+      if (speciesId) creature = await addCreature(c, me, speciesId, nickname);
       await c.query(
         `UPDATE user_stats
             SET total_mins = total_mins + $2,
@@ -941,7 +978,34 @@ app.post(
     });
 
     const stats = await query('SELECT * FROM user_stats WHERE user_id = $1', [me]);
-    res.json({ collection: await collectionOf(me), stats: stats.rows[0] });
+    res.json({
+      collection: await collectionOf(me),
+      creatures: await creaturesOf(me),
+      creature,
+      nicknameRejected,
+      stats: stats.rows[0],
+    });
+  })
+);
+
+/**
+ * Rename one of your fish. Pokemon lets you do this at any point, and so does
+ * this — the nickname is the diver's, not the species'.
+ */
+app.patch(
+  '/api/me/creatures/:id',
+  requireUser,
+  asyncRoute(async (req, res) => {
+    const me = req.user!.id;
+    // An empty string clears the nickname and falls back to the species name.
+    const raw = req.body?.nickname == null ? '' : String(req.body.nickname).trim();
+    if (raw) {
+      const problem = validateNickname(raw);
+      if (problem) return res.status(400).json({ error: problem });
+    }
+    const creature = await renameCreature(me, String(req.params.id), raw || null);
+    if (!creature) return res.status(404).json({ error: 'No such creature in your reef.' });
+    res.json({ creature, creatures: await creaturesOf(me) });
   })
 );
 
@@ -1309,8 +1373,22 @@ app.post(
     if ((mine[giveId] ?? 0) < 2) return res.status(400).json({ error: 'you need a spare of that species to offer it' });
     if ((theirs[getId] ?? 0) < 2) return res.status(400).json({ error: 'they only have one of that — they can’t spare it' });
 
+    // Which of your duplicates you are parting with. Optional: an older client
+    // names only the species, and the accept path picks one in that case.
+    const giveCreatureId = req.body?.giveCreatureId ? String(req.body.giveCreatureId) : null;
+    if (giveCreatureId) {
+      const owned = await query(
+        'SELECT 1 FROM user_creatures WHERE id = $1 AND user_id = $2 AND species_id = $3',
+        [giveCreatureId, me, giveId]
+      );
+      if (!owned.rows[0]) return res.status(400).json({ error: 'That fish isn’t yours to trade.' });
+    }
+
     const id = 't' + randomUUID().slice(0, 8);
-    await query('INSERT INTO trades (id, from_id, to_id, give_id, get_id) VALUES ($1,$2,$3,$4,$5)', [id, me, toId, giveId, getId]);
+    await query(
+      'INSERT INTO trades (id, from_id, to_id, give_id, get_id, give_creature_id) VALUES ($1,$2,$3,$4,$5,$6)',
+      [id, me, toId, giveId, getId, giveCreatureId]
+    );
     res.status(201).json(await tradesFor(me));
   })
 );
@@ -1327,20 +1405,30 @@ app.post(
       if (!trade) throw Object.assign(new Error('no such pending trade'), { status: 404 });
       if (trade.to_id !== me) throw Object.assign(new Error('only the recipient can accept'), { status: 403 });
 
-      // re-check both sides inside the transaction: stock may have changed
-      const a = await c.query('SELECT count FROM user_species WHERE user_id=$1 AND species_id=$2', [trade.from_id, trade.give_id]);
-      const b = await c.query('SELECT count FROM user_species WHERE user_id=$1 AND species_id=$2', [trade.to_id, trade.get_id]);
+      // Re-check both sides inside the transaction: stock may have changed
+      // since the offer was made. Counts come from the creatures themselves now.
+      const a = await c.query(
+        'SELECT COUNT(*)::int AS count FROM user_creatures WHERE user_id=$1 AND species_id=$2',
+        [trade.from_id, trade.give_id]
+      );
+      const b = await c.query(
+        'SELECT COUNT(*)::int AS count FROM user_creatures WHERE user_id=$1 AND species_id=$2',
+        [trade.to_id, trade.get_id]
+      );
       if ((a.rows[0]?.count ?? 0) < 2) throw Object.assign(new Error('they no longer have a spare'), { status: 409 });
       if ((b.rows[0]?.count ?? 0) < 2) throw Object.assign(new Error('you no longer have a spare'), { status: 409 });
 
-      await addSpecies(c, trade.from_id, trade.give_id, -1);
-      await addSpecies(c, trade.to_id, trade.give_id, +1);
-      await addSpecies(c, trade.to_id, trade.get_id, -1);
-      await addSpecies(c, trade.from_id, trade.get_id, +1);
+      // Two specific fish change hands, keeping their nicknames. The proposer
+      // chose theirs; the accepter never named one, so the server picks their
+      // newest duplicate and leaves the longest-held fish where it is.
+      const giving = trade.give_creature_id ?? (await oldestSpare(c, trade.from_id, trade.give_id));
+      const getting = await oldestSpare(c, trade.to_id, trade.get_id);
+      await moveCreature(c, giving, trade.from_id, trade.to_id);
+      await moveCreature(c, getting, trade.to_id, trade.from_id);
       await c.query(`UPDATE trades SET status='accepted', resolved_at=now() WHERE id=$1`, [trade.id]);
       return trade;
     });
-    res.json({ ok: true, trade: shapeTrade(out), collection: await collectionOf(me) });
+    res.json({ ok: true, trade: shapeTrade(out), collection: await collectionOf(me), creatures: await creaturesOf(me) });
   })
 );
 
